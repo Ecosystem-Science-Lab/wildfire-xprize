@@ -1,8 +1,12 @@
 # Detection Pipeline Design
 
+**Updated:** 2026-03-18 (revised priorities)
+
 ## 1. Pipeline Architecture Overview
 
-The detection pipeline processes satellite data through three passes, each trading compute time for accuracy. The entire chain must complete within 10 seconds of data arrival for geostationary data, and within 30 seconds for polar-orbiting data.
+The detection pipeline processes satellite data through two core passes. The entire chain must complete within 5 seconds of data arrival for geostationary data. ML classifier and CUSUM temporal detection are optional enhancements for Week 3.
+
+### Minimum Viable Pipeline (Week 1 Deliverable)
 
 ```
 Data Arrival
@@ -14,10 +18,25 @@ Data Arrival
 [Pass 1: Contextual Threshold] <2 sec
     |
     v
-[Pass 2: ML Classifier]        <1 sec (candidates only)
+Alert Policy Decision
+    |
+    +---> Strong anomaly: IMMEDIATE provisional alert
+    +---> Marginal anomaly: HOLD for 10-min confirmation frame
     |
     v
-[Pass 3: Temporal Integration]  <1 sec (update state)
+Event Store / Fusion Engine
+```
+
+### Optional Enhancements (Week 3 Stretch Goals)
+
+```
+After Pass 1 candidates:
+    |
+    v
+[Pass 2: ML Classifier]        <1 sec (candidates only)  -- OPTIONAL
+    |
+    v
+[Pass 3: CUSUM Temporal]       <1 sec (update state)     -- OPTIONAL
     |
     v
 Alert / Fusion Engine
@@ -38,27 +57,20 @@ For each sensor, the minimum preprocessing to enable fire detection:
 - NO atmospheric correction needed -- BT differences cancel most atmospheric effects
 - NO reprojection -- work in native AHI fixed grid
 
-**VIIRS (6 passes/day):**
-- If processing raw SDR/RDR: decode HDF5, extract I4 (3.74 um) and I5 (11.45 um) bands
-- If using FIRMS/DEA Hotspots point products: parse CSV/GeoJSON directly (no image processing needed)
-- Apply geolocation from embedded ephemeris
-- NO atmospheric correction
-- Handle bow-tie deletion fill values
+**VIIRS (via DEA Hotspots / FIRMS):**
+- Parse CSV/GeoJSON point products directly (no image processing needed)
+- No raw VIIRS processing in core pipeline -- this is a dropped scope item
+- If a direct broadcast partnership materializes, raw VIIRS processing becomes relevant, but it is not load-bearing
 
-**Landsat (opportunistic):**
-- If via USGS RT (4-6 hours): download L1 GeoTIFF, extract Band 7 (SWIR2) and Band 10 (TIR)
-- Convert DN to reflectance (Band 7) and BT (Band 10) using metadata scaling factors
-- If via FarEarth (<10s): process streaming X-band data line-by-line
-
-**Sentinel-2 (opportunistic):**
-- Download L1C tile, extract Band 12 (SWIR2, 2.19 um) and Band 4 (Red, 0.665 um)
-- Convert DN to TOA reflectance using metadata
+**Other sensors:**
+- Landsat, Sentinel-2, MODIS: consumed only via FIRMS point products in the core pipeline
+- No custom processing of raw imagery from these sensors
 
 ### 2.2 What We Skip (Key Insight)
 
 Atmospheric correction is NOT needed for fire detection. The fire signal (tens of kelvin BT anomaly) is orders of magnitude larger than atmospheric effects (~0.5-2 K). All operational fire detection algorithms (MOD14, VNP14IMG, ABI FDC) work on uncorrected brightness temperatures. Skipping atmospheric correction saves ~5-10 seconds per scene and eliminates dependency on ancillary data (NWP fields, ozone profiles, etc.).
 
-Orthorectification is not needed for geostationary data (fixed grid). For VIIRS, the built-in geolocation is sufficient (~375 m accuracy). For Landsat/Sentinel-2, the L1 products include adequate geolocation.
+Orthorectification is not needed for geostationary data (fixed grid). For VIIRS, the built-in geolocation is sufficient (~375 m accuracy).
 
 ### 2.3 Cloud Masking Strategy
 
@@ -72,9 +84,9 @@ Cloud masking must be fast but conservative (miss a cloud = false fire detection
 **Tier 2 (contextual, applied during fire detection):**
 - Reject fire candidates within 2 pixels of any Tier 1 cloud pixel
 - Use BT_11 spatial standard deviation to detect cloud edges (high variability = edge)
-- Accept that ~5-10% of cloud pixels will be missed -- the temporal persistence filter (Pass 3) handles transient false alarms from missed cloud edges
+- Accept that ~5-10% of cloud pixels will be missed -- the temporal persistence filter handles transient false alarms from missed cloud edges
 
-For VIIRS, use the operational VIIRS cloud mask (VCM) flags embedded in the fire product. For FIRMS point data, cloud masking is already applied upstream.
+For VIIRS, use the operational VIIRS cloud mask (VCM) flags embedded in the fire product. For FIRMS/DEA point data, cloud masking is already applied upstream.
 
 ---
 
@@ -116,7 +128,7 @@ Daytime candidates:
   BT_B7 > 310 K  AND  BTD > 20 K
 ```
 
-These are deliberately conservative -- they cast a wide net that Pass 2 and temporal filtering will narrow.
+These are deliberately conservative -- they cast a wide net that subsequent filtering will narrow.
 
 **Step 4: Contextual background characterization**
 
@@ -166,51 +178,79 @@ NSW in April (autumn) has different conditions than the tropics or CONUS:
 | Background window | 11x11 to 31x31 | 11x11 to 21x21 | NSW landscape is more heterogeneous |
 | Glint angle | 10 deg | 12 deg | Slightly wider glint zone for NSW water bodies |
 
-### 3.3 VIIRS VNP14IMG Adaptation
+### 3.3 VIIRS Processing
 
-If processing raw VIIRS data (direct broadcast scenario), implement the VNP14IMG algorithm as documented in the ATBD. Key parameters:
+**Core pipeline:** Consume DEA Hotspots and FIRMS point products. The VNP14IMG algorithm is already applied upstream -- we just ingest the detections with their confidence levels.
 
+**Stretch goal (only if direct broadcast partnership materializes):** If processing raw VIIRS data, implement the VNP14IMG algorithm as documented in the ATBD:
 - I4 (3.74 um) and I5 (11.45 um) at 375 m resolution
 - M13 (4.05 um) at 750 m for FRP retrieval (dual-gain, saturates at 634 K)
-- Fixed threshold: night BT_I4 > 320 K -> high confidence (class 9)
+- Fixed threshold: night BT_I4 > 320 K -> high confidence
 - Contextual window: 11x11 to 31x31 expanding
-- BT4S adaptive scene threshold: 325-330 K range
-- Day: BTD > 25 K AND BT_I4 > BT4S
-- Night: BTD > 10 K AND BT_I4 > 295 K
 
-If consuming FIRMS or DEA Hotspots point products, the algorithm is already applied -- we just ingest the detections with their confidence levels.
+### 3.4 Landsat and Sentinel-2
 
-### 3.4 Landsat Active Fire Algorithm
+**Core pipeline:** Consume via FIRMS point products only. No custom processing of raw imagery.
 
-Uses reflective SWIR bands (not thermal), following the LFTA approach:
-
-```
-Fire candidate IF:
-  B7_reflectance > threshold_B7 (typically 0.15-0.25)
-  AND B7/B4 ratio > threshold_ratio (typically 1.5-3.0)
-  AND B6_reflectance > threshold_B6
-```
-
-This can detect fires as small as ~4 m2 at 30 m resolution. Apply only to Landsat scenes that overlap with the competition area and arrive during the competition window.
-
-### 3.5 Sentinel-2 Fire Detection
-
-No thermal band -- use SWIR bands:
-
-```
-Fire candidate IF:
-  B12_TOA_reflectance > 0.15
-  AND B12/B4 > 2.0
-  AND spatial context anomaly (B12 > mean_B12 + 3*std)
-```
-
-Limited to daytime, limited sensitivity. Use for confirmation only.
+**Rationale:** Landsat has 2-4 overpasses during the entire 2-week competition (8-day combined revisit) with 4-6 hour latency. The FarEarth/Alice Springs real-time processing partnership is not viable at this timeline. Sentinel-2 has no thermal band and 5-day revisit.
 
 ---
 
-## 4. Pass 2: ML Classifier (False Positive Reduction)
+## 4. Alert Policy
 
-### 4.1 Architecture
+### 4.1 Immediate Alerting Path
+
+This is the critical change from the v1.0 plan. Instead of holding detections for 20-30 minutes for persistence confirmation, we use a tiered alerting approach:
+
+**Immediate report (no hold):**
+- Saturated pixels (BT >= 400 K): Report as HIGH confidence
+- Extreme anomalies (BT_B7 > 360 K night, BTD > mean + 5*sigma): Report as PROVISIONAL
+
+**10-minute hold:**
+- Marginal contextual detections (BTD > mean + 3.5*sigma but < 5*sigma): Hold for one additional frame
+- If persists in next frame: Report as PROVISIONAL
+- If disappears: Discard (transient artifact)
+
+**False positive risk assessment:**
+- The filtering pipeline (static masks, geometric filters, contextual detection) runs in <5 seconds BEFORE any alert. Most false positives are eliminated before the alert stage.
+- The clarification from the all-teams call says "low confidence detections still count if correct." The downside of a false positive is much less than the downside of a delayed true positive.
+- Emergency FP reduction protocols remain available if our rate exceeds 5%.
+
+### 4.2 Latency Budget (Immediate Alerting Path)
+
+| Stage | Time Budget | Cumulative |
+|-------|-------------|-----------|
+| SNS notification receipt | <0.5 s | 0.5 s |
+| S3 object fetch (B07 + B14 for NSW segments) | 1-3 s | 3.5 s |
+| HSD decode + BT conversion | 0.5 s | 4.0 s |
+| Cloud mask (Tier 1) | 0.2 s | 4.2 s |
+| Pass 1: Contextual threshold | 1.0 s | 5.2 s |
+| Fusion engine update + alert | 0.5 s | 5.7 s |
+| **Total processing** | **~5.7 s** | |
+
+**End-to-end latency:** 7-15 min (upstream data latency) + ~6 s (processing) = **~7-15 min from observation to alert** for immediate-path anomalies.
+
+### 4.3 Latency Budget (10-Minute Hold Path)
+
+Same as above, plus 10 minutes for one additional Himawari frame. Total: **~17-25 min from observation to alert.**
+
+### 4.4 DEA/FIRMS Path Latency
+
+| Stage | Time Budget | Cumulative |
+|-------|-------------|-----------|
+| API poll + response | 1-5 s | 5.0 s |
+| Parse detections | 0.1 s | 5.1 s |
+| Match to existing events | 0.2 s | 5.3 s |
+| Update confidence | 0.1 s | 5.4 s |
+| **Total processing** | **~5.4 s** | |
+
+**End-to-end latency:** ~17 min (DEA Hotspots upstream) + ~5 s (processing) = **~17 min from observation.**
+
+---
+
+## 5. Pass 2: ML Classifier (OPTIONAL -- Week 3 Stretch Goal)
+
+### 5.1 Architecture
 
 A lightweight CNN applied ONLY to candidate pixels from Pass 1. This is not a dense prediction model -- it classifies small patches around each candidate.
 
@@ -234,44 +274,47 @@ Inference time: <5 ms per candidate (CPU), <1 ms (GPU)
 
 **Output:** P(fire) in [0, 1]. Candidates with P(fire) > 0.5 proceed; those below are suppressed.
 
-### 4.2 Training Data Strategy
+### 5.2 Training Data Strategy
 
 **Positive samples (fire):**
-- VIIRS VNP14IMGML active fire product (validated fire pixels) from Black Summer 2019-2020 and subsequent NSW fire seasons
+- VIIRS VNP14IMGML active fire product from Black Summer 2019-2020 and subsequent NSW fire seasons
 - FIRMS historical fire detections over NSW (2015-2025)
 - Co-locate VIIRS fire pixels with contemporaneous Himawari AHI frames to extract AHI patches at known fire locations
-- Augment with prescribed burns with known ignition times from NSW RFS records
 
 **Negative samples (not fire):**
-- Random clear-sky land pixels from the same scenes as positive samples (10:1 negative:positive ratio)
-- Hard negatives: known false positive sources -- sun glint patches, hot bare ground, cloud edges, industrial sites
-- Use the FIRMS static thermal anomaly (STA) mask to sample persistent hot spots as negatives
+- Random clear-sky land pixels (10:1 negative:positive ratio)
+- Hard negatives: sun glint patches, hot bare ground, cloud edges, industrial sites
+- Use FIRMS static thermal anomaly (STA) mask to sample persistent hot spots as negatives
 
-**Sensor-specific models:**
-- Train separate models for AHI (2 km), VIIRS (375 m), and MODIS (1 km) due to different spectral responses and pixel sizes
-- The AHI model is most critical since it processes 144 scenes/day
+### 5.3 When to Implement
 
-**Class balance:**
-- Oversample fire class to 1:3 ratio (fire:non-fire)
-- Use focal loss to handle remaining imbalance
+Only implement if:
+- Core pipeline (Pass 0 + Pass 1 + alert policy) is stable and tested
+- FP rate during testing exceeds acceptable levels
+- There is engineering time available in Week 3
 
-### 4.3 Inference Optimization
-
-- Pre-compile model with ONNX Runtime for CPU inference (avoids GPU dependency)
-- Batch all candidates from a single frame (typically <100 candidates for NSW)
-- Total Pass 2 time: <500 ms for a typical Himawari frame with ~50 candidates
+The ML classifier reduces false positives by ~80% with minimal true fire loss. It is valuable but not essential if contextual detection + persistence gives acceptable FP rates.
 
 ---
 
-## 5. Pass 3: Sequential Temporal Detection (Kalman + CUSUM)
+## 6. Pass 3: Sequential Temporal Detection -- CUSUM (OPTIONAL -- Week 3 Stretch Goal)
 
-### 5.1 Why This Matters
+### 6.1 Reframed Role
 
-This is potentially our competitive edge. Single-frame geostationary detection requires fires of ~1,000-4,000 m2. Sequential temporal detection using CUSUM can detect fires of 200-500 m2 by integrating evidence across multiple 10-minute frames.
+CUSUM was previously positioned as our "competitive edge." External review and internal analysis showed this was overclaimed:
 
-The physics: A 200 m2 fire at 800 K in a 3.5 km AHI pixel produces a BT increase of ~0.15 K -- below the single-frame noise floor (~0.3-0.5 K). But over 6-12 frames (1-2 hours), the cumulative evidence exceeds the detection threshold.
+| Fire Area | CUSUM Detection Delay | Assessment |
+|---|---|---|
+| 200 m2 | ~11 hours | Too slow -- VIIRS will have passed before CUSUM triggers |
+| 500 m2 | ~2.3 hours | Marginal value -- covers the VIIRS gap |
+| 1,000 m2 | ~0.8 hours | Useful but single-frame contextual detection also catches these |
+| 5,000 m2 | 1 frame (instant) | No benefit -- already detectable in single frame |
 
-### 5.2 Implementation
+**Where CUSUM adds genuine value:** Background monitoring during the 10-11 hour VIIRS gap (15:00-01:00 AEST and 03:00-13:00 AEST). If a 500 m2 fire ignites at 16:00, CUSUM might flag it by 18:00 -- 7 hours before the next VIIRS pass.
+
+**Recommendation:** Implement as shadow layer in Week 3 if time permits. Run in parallel with contextual detection. Log detections for analysis but do not alert unless confirmed by contextual.
+
+### 6.2 Implementation (If Built)
 
 **Per-pixel state (maintained for all NSW land pixels, ~100,000 pixels):**
 
@@ -310,112 +353,21 @@ Parameters:
   Expected ARL_0 = ~930 frames = ~6.5 days (false alarm interval)
 ```
 
-**Multi-scale CUSUM (run 3 detectors in parallel):**
-
-```
-Detector 1: k_ref = 0.05 K, h = 2.0 K  -> very small fires (~50-100 m2), slow detection
-Detector 2: k_ref = 0.15 K, h = 2.0 K  -> medium fires (~200-500 m2)
-Detector 3: k_ref = 0.50 K, h = 2.0 K  -> larger fires (~1000+ m2), fast detection
-```
-
-### 5.3 Expected Performance
-
-| Fire Area (m2) | BT Increase (K) | SNR/frame | CUSUM Detection Delay | Delay (hours) |
-|----------------|------------------|-----------|----------------------|---------------|
-| 50 | ~0.04 | 0.10 | >200 frames | >33 |
-| 100 | ~0.08 | 0.20 | ~170 frames | ~28 |
-| 200 | ~0.15 | 0.38 | ~65 frames | ~11 |
-| 500 | ~0.35 | 0.88 | ~14 frames | ~2.3 |
-| 1,000 | ~0.70 | 1.75 | ~5 frames | ~0.8 |
-| 2,000 | ~1.40 | 3.50 | ~2 frames | ~0.3 |
-| 5,000 | ~3.50 | 8.75 | 1 frame | ~0.17 |
-
-### 5.4 Comparison: CUSUM vs RST-FIRES (ALICE)
-
-**RST-FIRES ALICE approach:**
-- Uses multi-year pixel-level statistics (mean and std) rather than real-time Kalman filter
-- Anomaly index: ALICE = (V - mu_V) / sigma_V where mu and sigma are from archive
-- Reported 3-70x more sensitive than other SEVIRI fire products
-- Simpler to implement (just a lookup table per pixel per time-of-day)
-- Weakness: requires multi-year homogeneous archive for each pixel
-
-**Our Kalman + CUSUM approach:**
-- Adapts in real-time to current conditions (no historical archive dependency)
-- Optimal detection delay (CUSUM is minimax optimal for change detection)
-- Handles non-stationary backgrounds (weather transitions, post-fire changes)
-- More complex to implement
-
-**Recommendation:** Implement CUSUM as the primary temporal detector. Pre-compute RST-style statistics from 1-2 years of Himawari archive as a cross-check and to initialize the Kalman filter states at competition start.
-
-### 5.5 Cloud Gap Handling
-
-When a pixel is cloud-covered, no observation is available. Strategy:
-
-1. Do NOT update the CUSUM statistic (preserve accumulated evidence)
-2. Apply exponential decay during gaps > 2 hours: S = S * exp(-dt / tau_decay) with tau_decay = 3 hours
-3. Let the Kalman filter prediction uncertainty grow (P_pred increases during gaps)
-4. When observation resumes, the Kalman gain is large (trusts new observation more)
-
----
-
-## 6. Latency Budget
-
-### 6.1 Geostationary (Himawari) Path
-
-| Stage | Time Budget | Cumulative |
-|-------|-------------|-----------|
-| SNS notification receipt | <0.5 s | 0.5 s |
-| S3 object fetch (B07 + B14 for NSW segments) | 1-3 s | 3.5 s |
-| HSD decode + BT conversion | 0.5 s | 4.0 s |
-| Cloud mask (Tier 1) | 0.2 s | 4.2 s |
-| Pass 1: Contextual threshold | 1.0 s | 5.2 s |
-| Pass 2: ML classifier (candidates) | 0.5 s | 5.7 s |
-| Pass 3: CUSUM update (all pixels) | 0.3 s | 6.0 s |
-| Fusion engine update + alert | 0.5 s | 6.5 s |
-| **Total processing** | **~6.5 s** | |
-
-This leaves ~3.5 seconds of margin within our 10-second target.
-
-### 6.2 Polar-Orbiting (VIIRS) Path
-
-**Option A: FIRMS/DEA Hotspots (point product)**
-
-| Stage | Time Budget | Cumulative |
-|-------|-------------|-----------|
-| API poll + response | 1-5 s | 5.0 s |
-| Parse detections | 0.1 s | 5.1 s |
-| Match to existing events | 0.2 s | 5.3 s |
-| Update confidence scores | 0.1 s | 5.4 s |
-| **Total** | **~5.4 s** | |
-
-**Option B: Direct broadcast (raw VIIRS data)**
-
-| Stage | Time Budget | Cumulative |
-|-------|-------------|-----------|
-| Data receipt from ground station | Variable | - |
-| SDR decode + BT conversion | 2-5 s | 5.0 s |
-| Cloud mask | 0.5 s | 5.5 s |
-| VNP14IMG fire detection | 2.0 s | 7.5 s |
-| ML classifier | 0.5 s | 8.0 s |
-| Fusion update + alert | 0.5 s | 8.5 s |
-| **Total processing** | **~8.5 s** | |
-
-### 6.3 High-Resolution (Landsat/Sentinel-2) Path
-
-Not time-critical (4+ hour latency upstream). Budget 30-60 seconds for processing.
+**Pre-initialization:** Compute Kalman states from 2-4 weeks of Himawari archive data before competition starts. This is required for CUSUM to function from day one.
 
 ---
 
 ## 7. Minimum Viable Processing Per Sensor Type
 
-| Sensor | Must Do | Can Skip | Processing Time |
-|--------|---------|----------|-----------------|
-| Himawari AHI | Decode HSD, BT conversion, cloud mask, contextual fire test | Atmospheric correction, reprojection, full cloud mask | ~5 s |
-| VIIRS (FIRMS) | Parse CSV, spatial match | Everything (already processed) | ~1 s |
-| VIIRS (raw) | Decode HDF5, BT conversion, cloud mask, VNP14IMG algorithm | Atmospheric correction, terrain correction | ~8 s |
-| Landsat | Decode GeoTIFF, SWIR reflectance, LFTA algorithm | Atmospheric correction (use TOA) | ~15 s |
-| Sentinel-2 | Decode JP2, SWIR reflectance, HTA test | Atmospheric correction | ~10 s |
-| MODIS | Parse FIRMS CSV or run MOD14 on raw data | Same as VIIRS | ~1-8 s |
+| Sensor | Core Pipeline Processing | Additional (Stretch) |
+|--------|------------------------|---------------------|
+| Himawari AHI | Decode HSD, BT conversion, cloud mask, contextual fire test, alert policy | ML classifier (Pass 2), CUSUM (Pass 3) |
+| VIIRS (DEA Hotspots) | Parse GeoJSON, spatial match to events | None needed |
+| VIIRS (FIRMS) | Parse CSV, spatial match to events | None needed |
+| VIIRS (raw) | NOT in core pipeline | VNP14IMG algorithm if partnership materializes |
+| Landsat | Via FIRMS only | NOT processing raw imagery |
+| Sentinel-2 | Via FIRMS/DEA only | NOT processing raw imagery |
+| GK-2A | Week 2: same contextual algorithm as Himawari | Cross-check feed only |
 
 ---
 
@@ -423,12 +375,8 @@ Not time-critical (4+ hour latency upstream). Budget 30-60 seconds for processin
 
 1. **AHI HSD decode speed**: Can we decode a single-band NSW segment in <0.5 seconds? Need to benchmark with `satpy` vs custom C decoder.
 
-2. **CUSUM initialization**: How long does the Kalman filter need to converge to a stable DTC model? Likely 24-48 hours of clear-sky observations. Must initialize from archive data before competition starts.
+2. **Optimal alert threshold tuning**: The 3.5-sigma vs 5-sigma split for immediate vs held alerts needs empirical validation on April-period Himawari data. Test during Week 1.
 
-3. **ML model generalization**: Will a model trained on Black Summer 2019-2020 data generalize to April 2026 autumn conditions? Need to validate on April-period historical data.
+3. **Computational architecture**: Lambda vs ECS for 5-second processing? Lambda cold start (~100-500 ms for Python) may be acceptable with provisioned concurrency. ECS with always-on containers eliminates cold start risk.
 
-4. **Optimal channel for CUSUM**: Use BT_3.9 alone, BTD (3.9 - 11.2), or both? BTD removes atmospheric noise but reduces fire signal by ~20-30%. Likely best to run CUSUM on BTD for robustness.
-
-5. **VZA-dependent thresholds**: At NSW latitudes, Himawari VZA is ~35-43 deg. Should detection thresholds scale with VZA? The pixel area increases by 1.8-2.4x, which proportionally increases minimum detectable fire size.
-
-6. **Computational architecture**: Lambda vs ECS for 10-second processing? Lambda cold start (~100-500 ms for Python) may be acceptable with provisioned concurrency. ECS with always-on containers eliminates cold start risk.
+4. **VZA-dependent thresholds**: At NSW latitudes, Himawari VZA is ~35-43 deg. Should detection thresholds scale with VZA? Nice to have, not essential for MVP.

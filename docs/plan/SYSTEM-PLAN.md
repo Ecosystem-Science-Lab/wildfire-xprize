@@ -1,7 +1,7 @@
 # XPRIZE Wildfire Track A Finals: Unified System Plan
 
-**Version:** 1.0
-**Date:** 2026-03-17
+**Version:** 2.0
+**Date:** 2026-03-18
 **Competition:** XPRIZE Wildfire Track A Finals, NSW Australia, April 9-21, 2026
 **Team:** Northern Arizona University
 
@@ -9,19 +9,41 @@
 
 ## Executive Summary
 
-We are building a satellite-based wildfire detection system for the XPRIZE Track A Finals in New South Wales, Australia. The system uses exclusively public satellite data to detect, characterize, and report wildfires across a ~800,000 km2 target area.
+We are building a satellite-based wildfire detection system for the XPRIZE Track A Finals in New South Wales, Australia. The system uses public satellite data to deliver the fastest, cleanest, most trustworthy fire intelligence possible, detecting, characterizing, and reporting wildfires across a ~800,000 km2 target area.
 
 **Our strategy centers on three pillars:**
 
-1. **Continuous geostationary monitoring** via Himawari-9 AHI with custom fire detection algorithms running on AWS, providing fire detection within 7-15 minutes of observation and characterization updates every 10 minutes.
+1. **Immediate alerting from geostationary monitoring** via Himawari-9 AHI with contextual fire detection running on AWS. Strong thermal anomalies are reported as provisional alerts within minutes of observation. Marginal detections are held for one confirmation frame (10 min) before reporting.
 
-2. **Sequential temporal detection (Kalman filter + CUSUM)** -- our competitive differentiator. By integrating evidence across multiple Himawari frames, we can detect fires of 200-500 m2 that are invisible to any single-frame geostationary algorithm. This pushes geostationary fire detection sensitivity 5-20x beyond conventional approaches.
+2. **Rule-based confidence ladder** with clear provenance tracking. Detections move through PROVISIONAL -> LIKELY -> CONFIRMED states based on transparent, debuggable rules. One observation = one evidence contribution, regardless of how many processing pipelines touch it.
 
-3. **Multi-sensor fusion with Bayesian confidence scoring** combining Himawari, GK-2A, VIIRS, MODIS, Landsat, Sentinel-2, FIRMS, and DEA Hotspots into a unified event stream with rigorously controlled false positive rate (<5%).
+3. **Multi-source corroboration** combining our custom Himawari processing with DEA Hotspots (VIIRS at ~17 min) and FIRMS as a safety net, producing a unified event stream with rigorously controlled false positive rate (<5%).
 
-**What we cannot do:** Hit the 1-minute-from-overpass metric for most observations. Our fastest detection is ~7 minutes (Himawari) or ~17 minutes (VIIRS via DEA Hotspots). Only a direct broadcast partnership (aspirational) or FarEarth Landsat deployment (aspirational) could achieve sub-minute detection.
+**Our insurance policy:** A fallback system (DEA Hotspots + FIRMS polling) is built FIRST, before any custom detection code. If our entire custom Himawari pipeline fails, judges still see fire detections on our portal within minutes.
 
-**Our honest competitive assessment:** We will likely be outperformed on small-fire detection speed by teams with commercial satellite data (OroraTech). We will likely be outperformed on LEO detection timing by teams with direct broadcast ground station access. Our advantages are in algorithmic sophistication (temporal integration), false positive control, continuous characterization, and system robustness.
+**What we cannot do:** Hit the 1-minute-from-overpass metric for most observations. Our fastest detection is ~7 minutes (Himawari) or ~17 minutes (VIIRS via DEA Hotspots). Only a direct broadcast partnership (aspirational) could achieve sub-minute detection.
+
+**Our honest competitive assessment:** We will likely be outperformed on small-fire detection speed by teams with commercial satellite data (OroraTech). We will likely be outperformed on LEO detection timing by teams with direct broadcast ground station access. Our advantages are in system robustness (fallback system + custom pipeline), false positive control, continuous characterization, and honest, transparent reporting that judges can trust.
+
+---
+
+## What We Learned from External Review
+
+An external review (ChatGPT Pro deep analysis, 2026-03-17) identified several critical flaws in our v1.0 plan:
+
+1. **CUSUM was overclaimed as our "competitive edge."** The detection delays (2-11 hours for 200-500 m2 fires) mean CUSUM adds nothing for fires large enough for single-frame detection, and takes too long for fires that VIIRS would catch anyway. CUSUM's sweet spot is narrow.
+
+2. **Bayesian log-odds suffered from double-counting.** The same Himawari observation processed by our pipeline, FIRMS, and DEA Hotspots was being summed as three independent evidence contributions. This inflated confidence and violated conditional independence assumptions.
+
+3. **No fallback system.** If the custom Himawari pipeline failed during competition, we had no backup. A system that detects fires but cannot show them to judges is worth zero.
+
+4. **Judge portal was deprioritized.** The portal was scheduled for Week 3-4 in the original plan. The portal IS the product -- judges experience our system through it.
+
+5. **Overclaiming on characterization.** "Perimeter" and "rate of spread" from sparse geostationary hotspot centroids is decorative, not operational. Honest uncertainty reporting is better.
+
+6. **Scope was too broad.** Eight sensor tiers with 22 days to build is not realistic. The plan needed ruthless focus.
+
+**How we responded:** Complete plan restructure. CUSUM and ML classifier demoted to optional stretch goals. Bayesian scoring replaced with rule-based confidence ladder. Fallback system and judge portal moved to Priority 1-2. Sensor scope cut to Himawari + DEA Hotspots + FIRMS core, with GK-2A as a Week 2 cross-check. Characterization claims made honest.
 
 ---
 
@@ -29,288 +51,409 @@ We are building a satellite-based wildfire detection system for the XPRIZE Track
 
 ```mermaid
 flowchart TB
-    subgraph "Satellite Sources"
-        H9[Himawari-9 AHI<br/>10-min, 2km]
-        GK[GK-2A AMI<br/>10-min, 2km]
-        V[VIIRS x3<br/>6 passes/day, 375m]
-        M[MODIS x2<br/>4 passes/day, 1km]
-        L[Landsat 8/9<br/>2-4 per 2 weeks, 30m]
-        S2[Sentinel-2<br/>Every 5 days, 20m]
+    subgraph "Satellite Sources (Core)"
+        H9[Himawari-9 AHI<br/>10-min, 2km<br/>CORE - Custom Processing]
+        DEA[DEA Hotspots<br/>VIIRS 6 passes/day, 375m<br/>CORE - Confirmation]
+        FIRMS_SRC[FIRMS API<br/>VIIRS/MODIS/Himawari<br/>CORE - Safety Net]
+    end
+
+    subgraph "Week 2 Addition"
+        GK[GK-2A AMI<br/>10-min, 2km<br/>Cross-check]
     end
 
     subgraph "Data Ingestion (AWS us-east-1)"
         SNS[AWS SNS<br/>Push Notifications]
-        SQS[SQS Queues<br/>Per-source]
-        FIRMS_API[FIRMS API<br/>Poll 5-min]
-        DEA_API[DEA Hotspots WFS<br/>Poll 5-min]
+        SQS[SQS Queue<br/>B07/B14 NSW Segments]
+        DEA_POLL[DEA Hotspots WFS<br/>Poll 5-min]
+        FIRMS_POLL[FIRMS API<br/>Poll 5-min]
     end
 
     subgraph "Detection Pipeline"
         P0[Pass 0: Decode + Subset<br/>< 1 sec]
         P1[Pass 1: Contextual Threshold<br/>< 2 sec]
-        P2[Pass 2: ML Classifier<br/>< 1 sec]
-        P3[Pass 3: CUSUM Temporal<br/>< 1 sec]
+        ALERT_POLICY[Alert Policy:<br/>Strong -> Immediate<br/>Marginal -> 10-min hold]
     end
 
-    subgraph "Fusion Engine"
-        EVT[Event Store<br/>DynamoDB]
-        BAYES[Bayesian Confidence<br/>Log-odds Scoring]
-        TRACK[Event Tracking<br/>State Machine]
+    subgraph "Event Management"
+        EVT[Event Store<br/>DynamoDB/SQLite]
+        LADDER[Rule-Based Confidence Ladder<br/>PROVISIONAL -> LIKELY -> CONFIRMED]
+        PROV[Provenance Tracking<br/>One obs = one evidence]
     end
 
     subgraph "Output"
-        ALERT[Fire Alerts<br/>Webhook/API]
-        OGC[OGC Reports<br/>GeoJSON/GeoPackage]
-        AGOL[ArcGIS Online<br/>Integration]
-        DAILY[Daily Reports<br/>To XPRIZE]
+        PORTAL[Judge Portal<br/>Leaflet.js Map<br/>Auto-refresh]
+        OGC[OGC Reports<br/>GeoJSON]
+        DAILY[Daily Reports<br/>20:00 AEST]
     end
 
     H9 --> SNS --> SQS --> P0
-    GK --> SNS
-    V --> DEA_API
-    V --> FIRMS_API
-    M --> FIRMS_API
-    L --> FIRMS_API
-    S2 --> DEA_API
+    GK -.-> SNS
 
-    P0 --> P1 --> P2 --> P3 --> EVT
-    FIRMS_API --> EVT
-    DEA_API --> EVT
+    P0 --> P1 --> ALERT_POLICY --> EVT
+    DEA_POLL --> EVT
+    FIRMS_POLL --> EVT
 
-    EVT --> BAYES --> TRACK --> ALERT
-    TRACK --> OGC --> AGOL
-    TRACK --> DAILY
+    EVT --> PROV --> LADDER --> PORTAL
+    LADDER --> OGC
+    LADDER --> DAILY
 ```
+
+**Note:** Dashed line for GK-2A indicates Week 2 addition, not Week 1 core.
 
 ---
 
-## Sensor Priority Ranking
+## Sensor Stack
 
-| Rank | Sensor | Role | Scoring Opportunities | Latency | Min Fire Size |
-|------|--------|------|----------------------|---------|---------------|
-| 1 | **Himawari-9 AHI** | Continuous trigger + characterization | 144 scans/day | 7-15 min | ~1,000-4,000 m2 single frame; ~200-500 m2 with CUSUM |
-| 2 | **VIIRS (3 satellites)** | Primary LEO confirmation | ~6 passes/day | 17 min (DEA) to 3 hr (FIRMS) | ~100-500 m2 |
-| 3 | **Landsat 8/9** | High-res opportunistic | 2-4 per 2 weeks | 4-6 hours | ~4 m2 |
-| 4 | **GK-2A AMI** | Independent geostationary cross-check | 144 scans/day | ~7-15 min | Similar to Himawari |
-| 5 | **MODIS (2 satellites)** | Supplementary LEO | ~4 passes/day | 17 min (DEA) to 3 hr (FIRMS) | ~1,000 m2 |
-| 6 | **Sentinel-3 SLSTR** | FRP confirmation | ~2-4 passes/day | ~3 hours | ~1,000 m2 |
-| 7 | **Sentinel-2 MSI** | Perimeter/burn scar | ~0.4 per day | 100 min - 3 hr | Limited (no thermal) |
-| 8 | **FY-4B / FY-3D** | Tertiary redundancy | Variable | Unknown | Variable |
+### Core (Must-Have, Week 1)
 
-**Justification for ranking:**
+| Sensor | Role | Latency | Min Fire Size |
+|--------|------|---------|---------------|
+| **Himawari-9 AHI** | Continuous trigger + characterization, 144 scans/day | 7-15 min | ~1,000-4,000 m2 |
+| **VIIRS via DEA Hotspots** | Primary LEO confirmation, 6 passes/day | ~17 min | ~100-500 m2 |
+| **FIRMS API** | Safety net, catches anything DEA misses | 30 min - 3 hr | Variable |
 
-Himawari is #1 because it provides continuous 24/7 coverage with the fastest operational data path (AWS NODD). It is our trigger layer and characterization backbone. VIIRS is #2 because its 375 m resolution provides the best active fire detection of any operational public sensor, and 6 daily passes give frequent scoring opportunities. Landsat is #3 despite sparse revisit because its 30 m resolution can detect fires of just a few square meters -- if an overpass aligns with a fire, the detection is far more valuable than a coarser sensor. GK-2A is #4 as an independent geostationary backup.
+### Week 2 Addition (Low-Effort, Real Value)
+
+| Sensor | Role | Latency | Min Fire Size |
+|--------|------|---------|---------------|
+| **GK-2A AMI** | Independent geostationary cross-check, different viewing angle | ~7-15 min | Similar to Himawari |
+
+### Dropped (Insufficient Time or Marginal Value)
+
+| Sensor | Reason for Dropping |
+|--------|-------------------|
+| Sentinel-3 SLSTR | ~3 hour latency, adds nothing over DEA Hotspots |
+| FY-4B | Data access unreliable from NSMC, adds complexity |
+| FY-3D MERSI | NSMC data access risk we cannot take in 22 days |
+| Raw VIIRS processing | Direct broadcast partnership is aspirational, not load-bearing |
+| Landsat real-time | FarEarth/Alice Springs partnership not viable at this timeline |
+| Sentinel-2 real-time | 5-day revisit, no thermal band, marginal value |
+| MODIS (separate processing) | Redundant with VIIRS, same orbits, coarser resolution |
+
+**Justification:** Himawari is #1 because it provides continuous 24/7 coverage with the fastest operational data path (AWS NODD with SNS push). DEA Hotspots is #2 because it provides VIIRS fire detections at ~17 min latency with zero engineering effort (WFS API, no registration). FIRMS is the safety net. GK-2A is a Week 2 addition because the AWS NODD mirror already exists and the incremental cost is trivial once Himawari works.
+
+---
+
+## Alert Policy
+
+### Tiered Immediate Alerting
+
+The previous plan held first detections for 20-30 minutes waiting for persistence. This is backwards for a speed competition where "low confidence detections still count if correct" (per the 2026-03-17 all-teams call clarification).
+
+**Tier 1 -- Immediate, HIGH confidence:**
+- Saturated pixels (BT >= 400 K) or extreme anomalies (BT_B7 > 360 K night)
+- Near-zero false positive risk
+- Report immediately
+
+**Tier 2 -- Immediate, PROVISIONAL confidence:**
+- Strong contextual detections (BTD > mean + 5*sigma)
+- Low false positive risk
+- Report immediately as PROVISIONAL
+
+**Tier 3 -- 10-minute hold, then PROVISIONAL:**
+- Marginal contextual detections (BTD > mean + 3.5*sigma but < 5*sigma)
+- Hold for one additional frame (10 min). If persists, report as PROVISIONAL
+- Balances speed against credibility
+
+**Key safeguard:** All reports clearly distinguish PROVISIONAL from CONFIRMED. Judges see "PROVISIONAL: thermal anomaly detected at [location], [time], awaiting confirmation" vs "CONFIRMED: fire detected at [location], corroborated by [sensors]."
 
 ---
 
 ## Detection Pipeline Design
 
-### Three-Pass Architecture
+### Minimum Viable Pipeline (Week 1 Deliverable)
 
-**Pass 1 -- Contextual Threshold Detection (~2 seconds per Himawari frame):**
+The core detection pipeline has two passes, not three. ML classifier and CUSUM are optional stretch goals for Week 3.
+
+**Pass 0 -- Preprocessing (<1 second):**
+- Decode Himawari HSD format for Band 7 (3.9 um) and Band 14 (11.2 um), NSW segments only
+- Convert raw counts to brightness temperature
+- Apply pre-computed land/water mask
+- No atmospheric correction, no reprojection
+
+**Pass 1 -- Contextual Threshold Detection (<2 seconds):**
 - AHI-adapted contextual fire algorithm based on GOES FDC and VNP14IMG
-- Nighttime: BT_B7 > 290 K AND BTD > 10 K, then contextual tests against 11x11 to 21x21 background window
-- Daytime: BT_B7 > 315 K AND BTD > 22 K, adjusted for NSW autumn conditions
-- Sun glint rejection for glint angle < 12 deg
-- Output: candidate fire pixels with initial confidence
+- Static masks (land/water, known industrial sites from FIRMS STA)
+- Sun glint rejection (glint angle < 12 deg)
+- Fast cloud mask (Tier 1: BT_11 < 265K, simple tests)
+- Contextual background characterization (11x11 to 21x21 window)
+- Alert generation with lat/lon, confidence tier, timestamp
 
-**Pass 2 -- ML Classifier (~0.5 seconds for all candidates):**
-- Lightweight CNN (32x32x3 input, ~35K parameters, <5 ms/candidate)
-- Applied ONLY to Pass 1 candidates
-- Trained on FIRMS-labeled fire/non-fire patches from Black Summer 2019-2020
-- Reduces false positives by ~80% with minimal true fire loss
+**Total processing latency: ~3-5 seconds from data arrival to alert.**
 
-**Pass 3 -- CUSUM Temporal Integration (~0.3 seconds for all NSW pixels):**
-- Kalman filter models expected diurnal BT cycle per pixel
-- CUSUM accumulates evidence for persistent positive anomalies
-- Multi-scale: 3 detectors targeting fires of 50-100 m2, 200-500 m2, and 1,000+ m2
-- Detection delay: ~2 hours for 500 m2 fire, ~11 hours for 200 m2 fire
-- False alarm rate: ~1 per pixel per 6.5 days
+See `detection-pipeline.md` for full algorithm details.
 
-**Total processing latency: ~6.5 seconds from data arrival to alert.**
+### Optional Enhancements (Week 3 Stretch Goals)
 
-### Sequential Temporal Detection: Our Competitive Edge
+**ML Classifier (Pass 2):** Lightweight CNN on AHI fire candidates, trained on FIRMS-labeled fire/non-fire patches. Reduces false positives by ~80%. Only implement if FP rate is concerning after Week 2 testing.
 
-The Kalman + CUSUM approach is the single most important algorithmic innovation in our system. It exploits the physics of persistent fire signals vs. zero-mean noise to detect fires below the single-frame threshold.
-
-**How it works:** A 200 m2 fire at 800 K produces a 0.15 K BT increase in a 3.5 km Himawari pixel -- below the 0.3-0.5 K noise floor of a single observation. But across 65 consecutive clear-sky observations (~11 hours), the signal accumulates to 65 x 0.15 K = 9.75 K of cumulative evidence while noise accumulates as sqrt(65) x 0.4 K = 3.2 K. The signal-to-noise ratio exceeds the detection threshold.
-
-**Comparison to alternatives:**
-- RST-FIRES (ALICE): simpler (lookup table), equally effective for large fires, but requires multi-year archive and cannot adapt to real-time conditions. We use RST-style pre-computed statistics to initialize our Kalman states.
-- GOES FDC temporal filter: simple 2-detection persistence test. Catches ~33% more fires than single-frame but cannot detect sub-threshold fires. Our CUSUM is strictly more powerful.
-
-**Key limitation:** Sequential detection requires clear-sky persistence. Under 80% cloud cover, most pixel time series are fragmented and CUSUM evidence decays during gaps.
+**CUSUM Temporal Detection (Pass 3):** Kalman filter + CUSUM as shadow layer, run in parallel with contextual detection. Potentially detects fires of 200-500 m2 that are invisible to single-frame detection. Pre-initialize from 2 weeks of Himawari archive. Only implement if core pipeline is stable.
 
 ---
 
-## Fusion and Confidence Strategy
+## Confidence and Fusion Strategy
 
-### Bayesian Log-Odds Framework
+### Rule-Based Confidence Ladder
 
-Each evidence source contributes a log-likelihood ratio to the cumulative fire probability:
+Replaces the Bayesian log-odds framework from v1.0. Simpler, debuggable, buildable in a day.
 
 ```
-P(fire) = sigmoid(prior_log_odds + sum(LLR_evidence))
+LEVEL 1 - PROVISIONAL (report immediately):
+  Single AHI frame, passes contextual tests
+
+LEVEL 2 - LIKELY (report with moderate confidence):
+  AHI persistent 2/3 frames, OR
+  AHI single frame + GK-2A independent detection
+
+LEVEL 3 - CONFIRMED (report with high confidence):
+  AHI detection + VIIRS/MODIS detection within spatial match radius, OR
+  AHI persistent 3/3 frames AND growing intensity
+
+LEVEL 4 - HIGH CONFIDENCE:
+  Multiple independent sensor confirmations (AHI + VIIRS + FIRMS NRT all agree)
+
+RETRACTED:
+  Single AHI frame, NOT confirmed in next 2 frames, no LEO confirmation within 6 hours
 ```
 
-**Key LLR values:**
-- AHI strong anomaly: +4.0
-- Persistent across 3 frames: +2.0
-- CUSUM threshold exceeded: +2.0
-- VIIRS high-confidence match: +4.0
-- GK-2A independent detection: +2.5
-- Landsat thermal anomaly: +5.0
-- Sun glint zone: -3.0
-- Known industrial site: -4.0
+### Event Lifecycle
 
-### Confidence Tiers and Reporting Rules
+```
+PROVISIONAL -> LIKELY -> CONFIRMED -> MONITORING -> CLOSED
+     |            |
+     +-> RETRACTED +-> RETRACTED
+```
 
-| Tier | P(fire) | Action |
-|------|---------|--------|
-| HIGH (>0.85) | Report immediately | AHI persistent + VIIRS confirm |
-| NOMINAL (0.50-0.85) | Report with caveat | AHI persistent, awaiting LEO |
-| LOW (0.20-0.50) | Monitor internally | Single AHI frame, moderate anomaly |
-| REJECTED (<0.20) | Suppress from output | Failed persistence or known FP |
+- **PROVISIONAL:** First detection. Report immediately with low confidence.
+- **LIKELY:** Passed persistence or independent confirmation. Upgrade report.
+- **CONFIRMED:** LEO sensor confirmation or multiple independent detections.
+- **MONITORING:** Fire confirmed, providing characterization updates for 12 hours per Rule 9.
+- **RETRACTED:** Failed persistence, no confirmation. Mark as retracted.
+- **CLOSED:** 12 hours elapsed or fire extinguished.
+
+### Provenance Tracking (Fixes Double-Counting)
+
+**Rule 1: One observation = one evidence contribution.** When the same satellite observation is processed by multiple pipelines (our custom, FIRMS, DEA), take the maximum confidence, not the sum.
+
+**Rule 2: Independence requires different sensors or different times.** True independent evidence comes from different satellites, different sensor types, or the same satellite at different times.
+
+**Rule 3: Every piece of evidence records:**
+- Source satellite
+- Observation time
+- Processing pipeline (custom, FIRMS, DEA)
+- Whether it is PRIMARY or DERIVED from a primary
+
+See `fusion-confidence.md` for full details.
 
 ### False Positive Control (<5% Target)
 
-Six-layer filtering pipeline:
+Four-layer filtering pipeline (core MVP):
 1. Static masks (land/water, urban, industrial) -- free, eliminates ~20% of FPs
 2. Geometric filters (sun glint, VZA limits) -- milliseconds, eliminates ~15% more
 3. Contextual detection (adaptive thresholds) -- ~1 second, eliminates ~80% of remaining
-4. ML classifier -- ~0.5 second, eliminates ~80% of remaining
-5. Temporal persistence (2/3 frames) -- ~20 minutes, eliminates ~80% of remaining
-6. Cross-sensor confirmation -- hours, near-zero FP rate
+4. Temporal persistence (2/3 frames) -- ~10-20 minutes, eliminates ~80% of remaining
 
-Expected result: <1 false positive per day among reported fires, well within the 5% target.
+Optional additions (Week 3):
+5. ML classifier -- ~0.5 second, eliminates ~80% of remaining
+6. Cross-sensor confirmation -- hours, near-zero FP rate
 
 **Emergency FP reduction:** If FP rate exceeds 5%, escalate through raising thresholds, night-only geostationary detection, requiring VIIRS confirmation, and finally manual review.
 
 ---
 
-## Partnership Requirements
+## Characterization: Honest and Useful
 
-### Must-Have (Available Now, No Partnership Needed)
+The R&R asks for "fire behavior including perimeter, direction and rate of spread, and intensity." We provide simple characterization that is honest about its limitations:
+
+| Field | What We Provide | What We Do NOT Claim |
+|-------|----------------|---------------------|
+| Location | Point with uncertainty circle (~2-3 km for AHI) | Precise perimeter polygon |
+| Size | "Detection covers approximately X km2 based on hot pixel count" | Precise area measurement |
+| Intensity | Qualitative (low/moderate/high) based on BT anomaly magnitude | Quantitative FRP from geostationary |
+| Direction/ROS | Only if 3+ sequential detections show centroid movement | Decorative arrows from 2 points |
+| Confidence | PROVISIONAL/LIKELY/CONFIRMED (intuitive) | P(fire) = 0.73 (opaque) |
+
+Label everything "estimated" not "measured." Judges will respect honesty more than overconfident claims.
+
+---
+
+## Partnership Strategy
+
+### Available Now (No Partnership Needed)
 
 | Resource | Access Path | Status |
 |----------|-----------|--------|
-| Himawari-9 data | AWS NODD S3 bucket | Public, available |
+| Himawari-9 data | AWS NODD S3 bucket + SNS | Public, available |
 | GK-2A data | AWS NODD S3 bucket | Public, available |
 | VIIRS/MODIS fire detections | DEA Hotspots WFS | Public, no registration |
 | VIIRS/MODIS fire detections | FIRMS API (MAP_KEY) | Free registration |
-| Himawari NRT data | JAXA P-Tree | Free registration |
-| Landsat data | USGS/AWS | Public domain |
-| Sentinel-2/3 data | Copernicus Data Space | Free registration |
-| AWS compute (us-east-1) | AWS account | Team account |
+| Himawari NRT data | JAXA P-Tree | Free registration (backup) |
 
-### Nice-to-Have (Significant Competitive Advantage)
+### Partnership Opportunities (Emails Sent Day 1)
 
-| Partner | What They Provide | Latency Gain | Probability |
-|---------|------------------|-------------|-------------|
-| GA (DEA Hotspots team) | Faster VIIRS data feed | ~17 min -> ~10 min | 60% |
-| BoM Satellite Operations | Direct broadcast VIIRS SDR | ~17 min -> ~5 min | 30% |
-| CfAT/Viasat Alice Springs | Ground station access | Variable | 20% |
-| OroraTech | Commercial thermal alerts | Adds ~200m, 30-min thermal | 15% |
+| Partner | What They Provide | Probability | Notes |
+|---------|------------------|-------------|-------|
+| BoM | HimawariRequest Target Area (2.5-min cadence) | 10-15% | Game-changing if approved, but low probability. One email to satellites@bom.gov.au |
+| OroraTech | Commercial thermal alerts during competition | 10-20% | Fills our biggest gap (small fires between VIIRS passes). Not "public data" but R&R allows legally-sourced data |
+| GA | Faster DEA Hotspots access | 20-30% | Priority API or raw data feed |
 
-### Aspirational (Low Probability, High Reward)
+### Not Pursuing
 
-| Partner | What They Provide | Impact | Probability |
-|---------|------------------|--------|-------------|
-| GA Alice Springs + FarEarth | Real-time Landsat fire detection | <10 sec Landsat = competition-defining | 5% |
-| BoM internal Himawari feed | Faster than public mirror | Shave 2-5 min off latency | 10% |
+| Partner | Reason |
+|---------|--------|
+| Earth Fire Alliance / FireSat | Not operational until mid-2026 |
+| FarEarth / Pinkmatter | Landsat real-time not viable at this timeline |
+| CfAT / Viasat | Commercial GSaaS adds complexity we cannot absorb |
 
-**Recommendation:** Build the system to work with must-have resources only. Pursue nice-to-have partnerships in parallel but do not make them load-bearing. Any partnership that materializes is pure upside.
+**Design principle:** The system works entirely on public data. Any partnership that materializes is pure upside, not load-bearing.
 
 ---
 
 ## Implementation Timeline
 
-**Today: March 17, 2026. Competition: April 9-21, 2026. Time remaining: ~23 days.**
+**Today: March 18, 2026. Competition: April 9-21, 2026. Time remaining: 22 days.**
+**CONOPS deadline: March 31, 2026.**
 
-### Week 1 (Mar 17-23): Data Plumbing
+### Priority 1: Fallback System + Judge Portal (Days 1-2, Mar 18-20)
+- DEA Hotspots WFS polling (every 5 min)
+- FIRMS API polling (every 5 min, requires MAP_KEY)
+- Simple deduplication by spatial proximity (2 km grid)
+- GeoJSON export
+- Basic web portal (Leaflet.js map, auto-refresh, colored dots by confidence)
+- **This is our insurance policy. If everything else fails, this works.**
 
-- [x] Register for all APIs (FIRMS, JAXA P-Tree, Copernicus, NASA Earthdata)
-- [ ] Set up AWS account in us-east-1
-- [ ] Subscribe to Himawari SNS notifications
-- [ ] Build SQS -> Lambda filter pipeline for AHI B07/B14
-- [ ] Build FIRMS API polling client
-- [ ] Build DEA Hotspots WFS polling client
-- [ ] Test end-to-end data flow: SNS -> decode -> basic BT conversion
+### Priority 2: Himawari Raw Pipeline + Contextual Detection (Days 2-7, Mar 19-24)
+- AWS account in us-east-1
+- Subscribe to Himawari SNS notifications
+- SQS queue with filter for B07/B14, NSW segments
+- HSD decode + BT conversion (satpy or custom decoder)
+- Static masks (land/water, industrial sites)
+- Sun glint rejection
+- Contextual threshold fire detection (adapted GOES FDC for AHI)
+- Cloud mask (Tier 1: simple BT thresholds)
+- Alert generation with lat/lon, confidence, timestamp
 
-### Week 2 (Mar 24-30): Core Detection
+### Priority 3: Event Store + Confidence Ladder + Portal Integration (Days 5-10, Mar 22-27)
+- Event store (DynamoDB or SQLite)
+- Provenance tracking (satellite, pipeline, observation time)
+- Rule-based confidence ladder (PROVISIONAL -> LIKELY -> CONFIRMED)
+- Portal shows custom Himawari detections alongside DEA/FIRMS fallback
+- Retraction logic for single-frame transients
+- OGC GeoJSON export with proper schema
 
-- [ ] Implement Pass 1: contextual threshold fire detection on AHI
-- [ ] Implement cloud masking (fast Tier 1)
-- [ ] Build event store (DynamoDB) with spatial indexing
-- [ ] Implement Bayesian confidence scoring
-- [ ] Implement OGC output format (GeoJSON)
-- [ ] Begin Kalman filter initialization from Himawari archive
-- [ ] Submit Finals Application (CONOPS, AI/ML Plan, System Diagram) by March 31
+### Priority 4: DEA/FIRMS Integration as Confirmation Layer (Days 7-12, Mar 24-29)
+- Cross-match DEA Hotspots detections with Himawari events
+- Cross-match FIRMS detections (VIIRS, MODIS)
+- Upgrade confidence on cross-sensor match
+- De-duplicate same-observation evidence (provenance-aware)
+- GK-2A cross-check (if Himawari pipeline is stable)
 
-### Week 3 (Mar 31 - Apr 6): Integration + ML + CUSUM
+### Priority 5: Daily Report Automation (Days 10-14, Mar 27-31)
+- Generate daily report per XPRIZE template (due 20:00 AEST daily)
+- Include all detected fires, sensor sources, confidence levels
+- GeoJSON/GeoPackage attachment for ArcGIS ingestion
+- Automate as much as possible (template fill + manual review)
 
-- [ ] Train ML classifier (Pass 2) on Black Summer + NSW fire data
-- [ ] Implement CUSUM temporal detection (Pass 3)
-- [ ] Integrate all sources into fusion engine
-- [ ] Build ArcGIS Online integration
-- [ ] Build daily report generator
-- [ ] Historical replay testing (April 2023-2025 fire seasons)
-- [ ] Compute overpass schedules from fresh TLEs
+### Priority 6: Send Partnership Emails (Day 1, Mar 18)
+- BoM: HimawariRequest Target Area + faster Himawari internal feed
+- OroraTech: trial/pilot during competition window
+- GA: faster DEA Hotspots access or priority API
+- Time cost: 2-3 hours. Do it today.
 
-### Week 4 (Apr 7-8): Pre-Competition Readiness
+### Priority 7: CONOPS + Finals Application (Days 7-13, Mar 24-31, due March 31)
+- CONOPS document
+- System diagram
+- AI/ML Plan (describe contextual detection + planned ML; TRL-7 claim is for the full pipeline)
+- Quad chart
+- Personnel list, ROM cost
+- Over-declare ALL potential EO sources in CONOPS
 
-- [ ] Travel to NSW
-- [ ] Final TLE refresh and overpass schedule computation
-- [ ] Initialize Kalman filter states from 2 weeks of recent Himawari data
-- [ ] End-to-end system test with live data
-- [ ] Verify ArcGIS Online integration
-- [ ] Prepare emergency fallback procedures
-- [ ] Load static masks (industrial sites, land cover, water bodies)
+### Priority 8 (Stretch): ML Classifier (Week 3, Mar 31+, if time)
+- Lightweight CNN on AHI fire candidates
+- Train on FIRMS-labeled fire/non-fire patches
+- Only implement if FP rate is concerning after Week 2 testing
 
-### Competition (Apr 9-21): Operations
+### Priority 9 (Stretch): CUSUM Temporal Detection (Week 3, Mar 31+, if time)
+- Kalman filter + CUSUM as shadow layer
+- Run in parallel with contextual detection
+- Pre-initialize from 2 weeks of Himawari archive
 
-- [ ] Monitor system 24/7
-- [ ] Daily report submission by 20:00 AEST
-- [ ] Manual review of alerts if FP rate is concerning
-- [ ] Daily TLE refresh for overpass predictions
-- [ ] Adapt thresholds if needed based on early results
+### Week 1 Checklist (March 18-24)
+
+**Day 1 (March 18):**
+- [ ] Send partnership emails: BoM, OroraTech, GA (3 emails, 2-3 hours)
+- [ ] Set up AWS account in us-east-1 (if not already done)
+- [ ] Register for FIRMS MAP_KEY (if not already done)
+- [ ] Start DEA Hotspots WFS polling client
+- [ ] Start FIRMS API polling client
+
+**Days 2-3 (March 19-20):**
+- [ ] Complete fallback system: DEA + FIRMS -> deduplication -> GeoJSON export
+- [ ] Deploy basic web portal (Leaflet.js map of NSW, shows DEA/FIRMS detections)
+- [ ] Subscribe to Himawari SNS topic (NewHimawariNineObject)
+- [ ] Set up SQS queue with message filtering for fire-relevant bands
+- [ ] Benchmark Himawari HSD decode speed (satpy vs custom)
+
+**Days 4-5 (March 21-22):**
+- [ ] Implement HSD decode + BT conversion for B07/B14 (NSW segments only)
+- [ ] Implement Tier 1 cloud mask
+- [ ] Implement static masks (land/water, from pre-computed shapefiles)
+- [ ] Implement sun glint rejection
+
+**Days 6-7 (March 23-24):**
+- [ ] Implement contextual threshold fire detection on AHI
+- [ ] Test end-to-end: SNS notification -> SQS -> decode -> detect -> alert
+- [ ] Measure actual Himawari AWS NODD latency (critical question)
+- [ ] Integrate custom Himawari detections into web portal
+- [ ] Begin event store implementation
+
+**Ongoing (all week):**
+- [ ] Monitor DEA Hotspots + FIRMS polling for reliability
+- [ ] Collect sample Himawari data for threshold tuning
+- [ ] Begin drafting CONOPS for Finals Application (due March 31)
+- [ ] Track responses from partnership emails
+- [ ] Over-declare ALL potential EO sources in CONOPS
+
+### Week 1 Exit Criteria
+
+By end of March 24, we should have:
+1. A working fallback system (DEA + FIRMS on a map)
+2. Himawari data flowing through our pipeline (even if detection is incomplete)
+3. Measured Himawari latency from AWS NODD
+4. Partnership emails sent
+5. CONOPS draft started
+6. A portal that a judge could look at and understand
 
 ---
 
 ## Risk Register
 
-| # | Risk | Likelihood | Impact | Mitigation | Owner |
-|---|------|-----------|--------|-----------|-------|
-| 1 | Himawari data feed fails | LOW | CRITICAL | GK-2A + JAXA P-Tree backup | Eng |
-| 2 | AWS us-east-1 outage | LOW | CRITICAL | JAXA/FIRMS/DEA fallback paths | Eng |
-| 3 | FP rate > 5% | MODERATE | HIGH | 6-layer filtering + emergency protocols | Algo |
-| 4 | Cloud cover > 70% during competition | MODERATE | HIGH | Cannot mitigate (physics); same for all teams | - |
-| 5 | Small fires (<500 m2) missed | HIGH | MODERATE | CUSUM temporal integration | Algo |
-| 6 | All partnerships fail | HIGH | MODERATE | System works on public data alone | Lead |
-| 7 | CUSUM state lost (DB failure) | LOW | MODERATE | Pre-init + persistent storage + snapshots | Eng |
-| 8 | OGC/ArcGIS integration breaks | LOW | HIGH | Test extensively pre-competition | Eng |
-| 9 | Competition rules misunderstood | LOW | HIGH | Attend all calls, over-declare sources | Lead |
-| 10 | Competitor has commercial data | HIGH | MODERATE | Differentiate on algorithms, not data | Lead |
-| 11 | Timeline too aggressive (23 days) | HIGH | CRITICAL | Prioritize MVP; CUSUM and ML are stretch goals | Lead |
-| 12 | Himawari HSD decode too slow | LOW | MODERATE | Benchmark early; fallback to satpy library | Eng |
+| # | Risk | Likelihood | Impact | Mitigation |
+|---|------|-----------|--------|-----------|
+| 1 | Himawari custom pipeline not ready by Week 2 | MODERATE | HIGH | Fallback system (DEA + FIRMS) provides basic capability from Day 1 |
+| 2 | False positive rate > 5% with immediate provisional alerts | MODERATE | HIGH | Tiered alerting (only extreme anomalies immediate), emergency threshold raising |
+| 3 | Portal not usable by judges | LOW | CRITICAL | Build portal FIRST (Priority 1), iterate daily |
+| 4 | AWS NODD Himawari latency > 15 min | MODERATE | MODERATE | Switch to JAXA P-Tree; use DEA Hotspots as primary geostationary |
+| 5 | OGC export format incompatible with ArcGIS | LOW | HIGH | Test GeoJSON import into ArcGIS Online before competition |
+| 6 | No partnership emails succeed | HIGH | MODERATE | System works entirely on public data; partnerships are pure upside |
+| 7 | CONOPS deadline missed (March 31) | LOW | CRITICAL | Start drafting in parallel with engineering work |
+| 8 | Too few engineering hours for scope | HIGH | HIGH | Revised scope is the minimum; cut ML and CUSUM first |
+| 9 | Overclaiming on characterization | LOW | MODERATE | Addressed: honest uncertainty, no decorative perimeters/ROS |
+| 10 | Double-counting inflates confidence | LOW | MODERATE | Addressed: provenance tracking, one obs = one evidence contribution |
+| 11 | Cloud cover > 70% during competition | MODERATE | HIGH | Cannot mitigate (physics); same for all teams |
+| 12 | Competitor has commercial satellite data | HIGH | MODERATE | Cannot match; differentiate on robustness and FP control |
 
 ---
 
-## Open Questions Requiring Answers
+## Open Questions
 
-1. **Does the 1-minute metric apply to geostationary scans?** If each Himawari scan counts as an "overpass" with its own 1-minute clock, we cannot score on this metric (7-15 min latency). If only LEO passes count, we have 6 VIIRS scoring opportunities per day at ~17 min latency. Clarify with XPRIZE.
+1. **What is the actual Himawari AWS NODD latency?** We estimate 7-15 minutes but need to measure empirically during Week 1. If consistently >15 minutes, consider switching to JAXA P-Tree as primary.
 
-2. **How are prescribed burns vs. wildfires scored?** The rules say "detect all fires." Prescribed burns (hazard reduction burns) are real fires -- do we get credit for detecting them? Or only XPRIZE-ignited competition fires?
+2. **Does the 1-minute metric apply to geostationary scans?** If each Himawari scan counts as an "overpass" with its own 1-minute clock, we cannot score on this metric (7-15 min latency). If only LEO passes count, we have 6 VIIRS scoring opportunities per day at ~17 min latency.
 
-3. **What is the actual Himawari AWS NODD latency?** We estimate 7-15 minutes but need to measure empirically during Week 1. If consistently >15 minutes, consider switching to JAXA P-Tree as primary.
+3. **How are prescribed burns vs. wildfires scored?** The clarification says "report EVERY fire detected." We will report all fires and any correct detection counts favorably.
 
-4. **Can we access DEA Hotspots underlying data?** The WFS provides point detections. Can we access the underlying Himawari/VIIRS imagery from GA's processing pipeline? This would give us faster-than-public Himawari data without a formal partnership.
-
-5. **What is the CUSUM residual sigma achievable in practice?** Our performance estimates assume 0.3-0.8 K residual standard deviation after DTC subtraction. The actual value determines whether CUSUM can detect 200 m2 fires in 11 hours (sigma = 0.4 K) or 22+ hours (sigma = 0.8 K). Must characterize empirically.
-
-6. **Is our 23-day timeline realistic?** The implementation plan is aggressive. If CUSUM and ML are not ready by competition, can we win with contextual detection + temporal persistence + fusion alone? Probably not win, but competitive.
-
-7. **Should we pursue OroraTech as a commercial data partner?** Their constellation provides the exact capability we lack (sub-30-min thermal revisit at ~200 m). But "public data only" may be interpreted to exclude commercial services. Clarify with XPRIZE.
+4. **Is our 22-day timeline realistic with the revised scope?** The revised scope (contextual detection + rule-based confidence + portal) is buildable. ML and CUSUM are explicitly cut from the critical path.
 
 ---
 
@@ -318,20 +461,23 @@ Expected result: <1 false positive per day among reported fires, well within the
 
 | Decision | Rationale | Alternative Considered |
 |----------|-----------|----------------------|
-| Process in native sensor grids | Avoids reprojection latency (~5 sec savings) and interpolation artifacts | Reproject to common grid for fusion -- rejected for speed |
-| Himawari via AWS NODD (not JAXA P-Tree) | Push notifications via SNS enable event-driven pipeline; P-Tree requires polling | JAXA P-Tree as primary -- reserved as backup |
-| Kalman + CUSUM over RST-FIRES (ALICE) | Adapts in real-time; no multi-year archive dependency; optimal detection delay | RST-FIRES is simpler but requires historical archive construction |
-| Bayesian log-odds over Dempster-Shafer | Simpler, well-understood, handles conditional independence assumption | D-S handles conflicting evidence better but more complex |
-| Lightweight CNN over transformer/foundation model | <5 ms inference on CPU; no GPU dependency; sufficient for binary fire/no-fire | Large models could improve accuracy but require GPU and more training data |
-| DynamoDB over PostgreSQL/PostGIS for event store | Serverless, auto-scaling, sub-millisecond reads at competition scale | PostGIS has better spatial query support but requires instance management |
-| Report ALL fires (including prescribed burns) | Rules say "detect all fires"; any correct detection helps score | Only report competition fires -- but we cannot know which are competition fires |
+| Build fallback system first | Insurance against custom pipeline failure; judges must see SOMETHING | Build custom pipeline first -- too risky if it fails |
+| Process in native sensor grids | Avoids reprojection latency (~5 sec savings) and interpolation artifacts | Reproject to common grid -- rejected for speed |
+| Himawari via AWS NODD (not JAXA P-Tree) | Push notifications via SNS enable event-driven pipeline | JAXA P-Tree as primary -- reserved as backup |
+| Rule-based confidence over Bayesian log-odds | Simpler, debuggable, no double-counting bugs, buildable in a day | Bayesian -- elegant but requires careful LLR calibration we lack |
+| Lightweight CNN as stretch goal (not core) | 22 days insufficient to train and validate properly | CNN in core pipeline -- too risky to depend on |
+| CUSUM as stretch goal (not core) | Detection delays (2-11 hours) are too slow to be the "competitive edge" | CUSUM as centerpiece -- overclaimed in v1.0 |
+| DynamoDB/SQLite for event store | Simple, sufficient for competition scale | PostGIS has better spatial queries but more operational overhead |
+| Report ALL fires (including prescribed burns) | Rules say "detect all fires"; any correct detection helps score | Only report competition fires -- but we cannot know which are which |
+| Honest characterization with uncertainty | Judges respect honesty; overclaiming destroys credibility | Decorative perimeters and ROS -- overclaimed in v1.0 |
+| GeoJSON for OGC compliance | OGC standard since 2016, directly ingestible by ArcGIS Online | GeoPackage -- also good but GeoJSON is simpler for real-time |
 
 ---
 
 ## Conclusion
 
-This system plan is designed to be buildable in 23 days by a small team, operational on day one of the competition, and differentiated by algorithmic innovation rather than data access advantages. The Kalman + CUSUM temporal detection approach is our primary competitive edge -- if it works as theoretically predicted, it gives us geostationary fire detection sensitivity 5-20x better than conventional single-frame algorithms.
+This v2.0 plan reflects hard lessons from external review. We have cut scope aggressively, demoted overclaimed capabilities to stretch goals, and reoriented the entire plan around the question: "what will judges actually see?"
 
-The system is robust to partnership failures (works on public data alone), cloud cover (degrades gracefully, same as all teams), and data feed interruptions (multiple fallback paths). The primary risks are timeline pressure (23 days is tight for ML + CUSUM implementation) and the inherent resolution limitations of geostationary data for small fire detection.
+The answer: a map with fire detections that appear quickly, are labeled honestly, and export cleanly to OGC format. The fallback system ensures judges always see something. The custom Himawari pipeline makes what they see faster and better. Everything else is upside.
 
-Our strategy is to be the team with the lowest false positive rate, the most continuous monitoring, and the most sophisticated use of geostationary temporal data. We accept that we may not be the fastest to detect each individual fire, but we aim to be the most reliable and comprehensive across the full competition window.
+Our strategy is not to be the most algorithmically sophisticated team. It is to be the team with the most reliable, trustworthy, and transparent fire detection system -- one that works on day one and keeps working through day thirteen.

@@ -1,192 +1,217 @@
 # Sensor & Data Access Strategy
 
-## 1. Sensor Ranking by Scoring Value
+**Updated:** 2026-03-18 (revised priorities)
 
-The competition scores detection within 1 minute of satellite overpass and characterization within 10 minutes. Each overpass that catches a fire is a scoring opportunity. The sensors are ranked by the product of (scoring opportunities per day) x (detection sensitivity) x (achievable data latency).
+## 1. Core Sensor Stack
 
-### Rank 1: Himawari-9 AHI (Geostationary -- PRIMARY)
+The revised plan focuses ruthlessly on three data sources that are available now, require no partnerships, and can be integrated in the first week.
+
+### Rank 1: Himawari-9 AHI (Geostationary -- PRIMARY, Custom Processing)
+
+- **Role:** Continuous trigger layer and characterization backbone
 - **Scoring opportunities**: 144 per day (every 10 minutes, 24/7)
 - **Sensitivity**: ~1,000-4,000 m2 minimum at NSW latitudes (3-4 km effective pixels)
-- **Realistic latency**: 7-15 minutes from observation to data availability (JAXA P-Tree: 5-20 min; AWS NODD: similar)
-- **1-minute scoring feasibility**: NO for the 1-minute-from-overpass metric, but YES for the ongoing 15-minute characterization updates. Himawari's primary value is continuous monitoring and rapid characterization updates, not 1-minute detection scoring.
-- **Strategic role**: Continuous fire monitoring, trigger layer, characterization updates every 10 minutes
+- **Realistic latency**: 7-15 minutes from observation to data availability (AWS NODD)
+- **1-minute scoring feasibility**: NO for the 1-minute-from-overpass metric. Himawari's value is continuous monitoring, rapid alerting, and characterization updates every 10 minutes.
+- **Data access**: AWS NODD S3 bucket with SNS push notifications (`NewHimawariNineObject` topic in us-east-1). Event-driven pipeline.
+- **Backup access**: JAXA P-Tree (free registration, polling, 5-20 min latency)
+- **Processing**: Custom contextual threshold fire detection (see `detection-pipeline.md`)
 
-### Rank 2: VIIRS (S-NPP + NOAA-20 + NOAA-21 -- WORKHORSE)
-- **Scoring opportunities**: ~6 per day (3 day + 3 night passes)
-- **Sensitivity**: ~100-500 m2 minimum (375 m pixels)
-- **Realistic latency**:
-  - Direct broadcast via Australian ground stations: 5-15 min after overpass
-  - DEA Hotspots (GA): ~17 min minimum after overpass
-  - FIRMS NRT (global): up to 3 hours (NOT suitable for 1-minute scoring)
-- **1-minute scoring feasibility**: YES if we can get data within ~30 seconds of ground station reception and run our detection in <30 seconds. Requires partnership with GA/BoM for direct broadcast data.
-- **Strategic role**: Highest-value scoring opportunities if we can achieve fast data access. Each of the 6 daily passes is a distinct scoring opportunity.
+### Rank 2: VIIRS via DEA Hotspots (LEO -- PRIMARY CONFIRMATION)
 
-### Rank 3: Landsat 8/9 OLI+TIRS (HIGH-RESOLUTION -- OPPORTUNISTIC)
-- **Scoring opportunities**: 2-4 during the entire 2-week competition (8-day combined revisit)
-- **Sensitivity**: ~4 m2 (30 m SWIR, 100 m thermal) -- by far the best
-- **Realistic latency**: 4-6 hours via USGS RT tier (standard path); <10 seconds theoretically via FarEarth Observer at Alice Springs (requires partnership)
-- **1-minute scoring feasibility**: NO via standard pipeline. THEORETICALLY YES via FarEarth/Alice Springs partnership, but this is the highest-risk, highest-reward option.
-- **Strategic role**: If a Landsat overpass coincides with a competition fire, the 30 m resolution gives us detection of fires orders of magnitude smaller than any other sensor. Extremely high scoring value per event, but extremely few events.
+- **Role:** Highest-value confirmation layer. Each VIIRS detection matching a Himawari alert upgrades confidence to CONFIRMED.
+- **Scoring opportunities**: ~6 per day (3 satellites x ~2 passes each)
+- **Sensitivity**: ~100-500 m2 (375 m pixels)
+- **Realistic latency**: ~17 minutes minimum after overpass (GA processing pipeline)
+- **1-minute scoring feasibility**: NO at 17-min latency. Would require direct broadcast partnership (not load-bearing).
+- **Data access**: DEA Hotspots WFS API. Public, no registration required. Poll every 5 minutes.
+- **Processing**: Parse GeoJSON point products. No raw VIIRS processing needed.
 
-### Rank 4: GK-2A AMI (Geostationary -- REDUNDANCY)
-- **Scoring opportunities**: 144 per day (same as Himawari)
-- **Sensitivity**: Similar to Himawari but slightly worse geometry for NSW (128.2E vs 140.7E)
-- **Realistic latency**: AWS NODD mirror available, no SNS push notifications documented
-- **1-minute scoring feasibility**: Same constraints as Himawari
-- **Strategic role**: Independent cross-check against Himawari. Detections from GK-2A that confirm Himawari detections significantly boost confidence. Detections from GK-2A when Himawari has gaps (maintenance, cloud) provide continuity.
+### Rank 3: FIRMS API (Multi-Sensor -- SAFETY NET)
 
-### Rank 5: MODIS (Terra + Aqua -- SUPPLEMENTARY)
-- **Scoring opportunities**: ~4 per day (2 satellites x 2 passes, but Aqua overlaps VIIRS timing)
-- **Sensitivity**: ~1,000 m2 (1 km pixels)
-- **Realistic latency**: Similar to VIIRS (same ground stations). FIRMS NRT: up to 3 hours.
-- **Strategic role**: Supplementary confirmation. Terra's drifting orbit (now ~08:30 crossing) provides morning coverage when VIIRS is absent.
+- **Role:** Catches anything DEA misses. Provides VIIRS, MODIS, and Himawari fire detections from NASA's global processing.
+- **Latency**: 30 min for Real-Time (RT), up to 3 hours for Near-Real-Time (NRT)
+- **Data access**: FIRMS API with MAP_KEY (free registration). Poll every 2-5 minutes.
+- **Processing**: Parse CSV. Spatial/temporal match to existing events.
+- **Key value**: If DEA Hotspots has an outage, FIRMS provides backup VIIRS data. If our Himawari processing has issues, FIRMS provides Himawari fire detections from NASA's processing chain.
 
-### Rank 6: Sentinel-3 SLSTR (SUPPLEMENTARY)
-- **Scoring opportunities**: ~2-4 per day
-- **Sensitivity**: Similar to MODIS (~1 km)
-- **Realistic latency**: ~3 hours via Copernicus
-- **Strategic role**: FRP confirmation. Not fast enough for 1-minute scoring.
+---
 
-### Rank 7: Sentinel-2 MSI (CONFIRMATION)
-- **Scoring opportunities**: ~0.4 per day (5-day revisit)
-- **Sensitivity**: 20 m SWIR (no thermal band)
-- **Realistic latency**: 100 min - 3 hours
-- **Strategic role**: Post-detection confirmation and perimeter mapping if overpass aligns
+## 2. Week 2 Addition: GK-2A AMI (Cross-Check)
 
-### Rank 8: FY-4B / FY-3D MERSI (SUPPLEMENTARY)
-- **FY-4B**: Geostationary at 123.5E, 15-min cadence, fire products available. Supplementary to Himawari.
-- **FY-3D MERSI-II**: 250 m thermal -- best polar-orbiting resolution -- but data access reliability from NSMC is a concern.
-- **Strategic role**: Nice-to-have redundancy. Do not depend on for real-time operations.
+- **Role:** Independent geostationary cross-check from a different viewing angle (128.2E vs 140.7E for Himawari)
+- **Why keep it:** The AWS NODD mirror already exists. The incremental engineering cost is trivial once the Himawari pipeline works (same ABI-class instrument, same data format). GK-2A provides genuinely independent confirmation -- different satellite, different operator (KMA), different viewing angle.
+- **Why Week 2 (not Week 1):** Focus Week 1 on getting Himawari + fallback working. GK-2A is low-effort once Himawari is stable.
+- **Data access**: AWS NODD at `noaa-gk2a-pds`. No SNS push notifications documented -- may need polling.
+- **Processing**: Run the same contextual algorithm used for Himawari. Feed detections into the event store as cross-check evidence (different satellite = independent confirmation).
+- **NOT a separate detection pipeline.** GK-2A detections feed into the same event store. They upgrade confidence when they independently confirm a Himawari detection.
 
-## 2. Realistic Data Latency for Each Sensor Over NSW
+---
+
+## 3. Dropped Sensors
+
+| Sensor | Why Dropped | Alternative |
+|--------|-----------|-------------|
+| **Sentinel-3 SLSTR** | ~3 hour latency via Copernicus, adds nothing over DEA Hotspots at 17 min | VIIRS via DEA covers the same fires faster |
+| **FY-4B** | Data access from NSMC is unreliable for real-time operations | Himawari + GK-2A provide two geostationary sources |
+| **FY-3D MERSI** | 250 m is tempting but NSMC data access risk is unacceptable in 22 days | VIIRS at 375 m via DEA is reliable |
+| **Raw VIIRS processing** | Direct broadcast partnership is aspirational, not load-bearing | DEA Hotspots at ~17 min is our realistic VIIRS path |
+| **Landsat real-time** | FarEarth/Alice Springs partnership not viable at this timeline | Landsat detections via FIRMS (4-6 hr latency) only |
+| **Sentinel-2 real-time** | 5-day revisit, no thermal band, marginal value | Via FIRMS/DEA only |
+| **MODIS (separate processing)** | Redundant with VIIRS (same orbits), coarser resolution (1 km vs 375 m) | MODIS detections come through FIRMS automatically |
+
+---
+
+## 4. Partnership Opportunities
+
+### HimawariRequest Rapid Scan (2.5-min cadence)
+
+The AHI Target Area scan provides 2.5-minute cadence over a 1000x1000 km box. This would cut our geostationary revisit from 10 min to 2.5 min -- transformative for detection speed.
+
+**Status:** Controlled by JMA, primarily used for typhoons and volcanoes. Requesting it for a 2-week fire competition in NSW requires JMA agreement, likely brokered through BoM (satellites@bom.gov.au).
+
+**Probability:** LOW (10-15%). But the cost of asking is one email. Send it, expect nothing, move on.
+
+### OroraTech Commercial Thermal Alerts
+
+OroraTech claims 3-minute alerts, 4x4m fire detection, ~16+ satellites operational by April 2026. If they would share alerts during the competition window:
+- We get an independent, high-resolution thermal detection layer we cannot build ourselves
+- It fills our biggest gap (small fires between VIIRS passes)
+
+**Legal:** The R&R says "observations of wildfires shall be made from Space" and "legally-sourced data." It does NOT say "public data only." Commercial data is allowed as long as it is declared and legally obtained.
+
+**Probability:** LOW (10-20%). Contact OroraTech sales. Worst case: they say no.
+
+### Faster DEA Hotspots / GA Partnership
+
+Contact GA (earth.observation@ga.gov.au) about faster DEA Hotspots access or a priority API during the competition window.
+
+**Probability:** MODERATE (20-30%). GA may be supportive given the XPRIZE visibility.
+
+### NOT Pursuing
+
+| Partner | Reason |
+|---------|--------|
+| Earth Fire Alliance / FireSat | Phase 1 (3 satellites) planned for mid-2026, NOT operational by April 9 |
+| FarEarth / Pinkmatter | Landsat real-time at Alice Springs is not viable at 22-day timeline |
+| CfAT / Viasat GSaaS | Commercial ground station adds complexity we cannot absorb |
+
+**Design principle:** Design everything around DEA Hotspots as the VIIRS path and AWS NODD as the Himawari path. Any partnership that materializes is pure upside, not load-bearing.
+
+---
+
+## 5. Realistic Data Latency for Core Stack Over NSW
 
 | Sensor | Data Access Path | Realistic Latency | Bottleneck |
 |--------|-----------------|-------------------|-----------|
-| Himawari-9 | JAXA P-Tree | 5-20 min | JMA processing + transmission |
-| Himawari-9 | AWS NODD (noaa-himawari) | 7-15 min (est.) | JMA->NOAA relay |
-| GK-2A | AWS NODD (noaa-gk2a-pds) | Similar to Himawari | KMA->NOAA relay |
-| VIIRS | Direct broadcast (GA Alice Springs) | 5-15 min | Ground station processing |
-| VIIRS | DEA Hotspots | ~17 min minimum | GA processing pipeline |
-| VIIRS | FIRMS NRT | Up to 3 hours | Global processing queue |
-| MODIS | Direct broadcast | 5-15 min | Same as VIIRS |
-| MODIS | FIRMS NRT | Up to 3 hours | Global processing queue |
-| Landsat | USGS RT tier | 4-6 hours | Transfer to EROS + processing |
-| Landsat | FarEarth Observer (Alice Springs) | <10 seconds | Partnership required |
-| Sentinel-2 | Copernicus NRT | 100 min - 3 hours | Ground segment |
-| Sentinel-3 | Copernicus NRT | ~3 hours | Ground segment |
-| FY-4B | NSMC | Unknown | International access reliability |
+| Himawari-9 | AWS NODD (noaa-himawari) + SNS push | 7-15 min (est.) | JMA->NOAA relay |
+| Himawari-9 | JAXA P-Tree (backup) | 5-20 min | JMA processing |
+| GK-2A | AWS NODD (noaa-gk2a-pds), polling | ~7-15 min (est.) | KMA->NOAA relay |
+| VIIRS | DEA Hotspots WFS | ~17 min minimum | GA processing pipeline |
+| VIIRS/MODIS/Himawari | FIRMS API (RT) | ~30 min | Global processing queue |
+| VIIRS/MODIS/Landsat | FIRMS API (NRT) | Up to 3 hours | Global processing queue |
 
-## 3. Which Sensors Can Hit the 1-Minute-From-Overpass Window?
+**Critical unknown:** Actual AWS NODD Himawari latency. Must measure empirically during Week 1. If consistently >15 minutes, switch to JAXA P-Tree as primary.
 
-The scoring rule states: 1-minute detection is measured from satellite overpass, with each overpass getting its own 1-minute clock. This means we need data + processing completed within 1 minute of the satellite passing over the fire.
+---
 
-**Can hit 1 minute:**
-- **VIIRS via direct broadcast** -- IF we have a direct feed from an Australian ground station (GA Alice Springs processes VIIRS RDR) and can run our fire detection algorithm within seconds of data availability. Realistic chain: overpass -> X-band downlink (~5 min pass) -> L0/RDR processing -> our algorithm -> alert. The 5-15 min ground processing latency likely means we CANNOT hit 1 minute from overpass start, but MAY be able to hit 1 minute from the overpass midpoint if we can access partial-pass data.
-- **Landsat via FarEarth Observer** -- IF deployed at Alice Springs. FarEarth processes data line-by-line during the pass, achieving <10 second latency. This is the only technology that can genuinely hit 1 minute from overpass.
-
-**Cannot hit 1 minute:**
-- **Himawari**: 7-15 minute minimum latency means we're always 6-14 minutes late for the "1 minute from overpass" metric. However, Himawari observations are continuous -- the question is whether judges treat each 10-minute scan as an "overpass."
-- **All FIRMS-based data**: Minimum 30 minutes for RT, hours for NRT
-- **Copernicus data**: 100+ minutes minimum
-
-**Critical question for XPRIZE**: Does the "1-minute from overpass" scoring apply to geostationary satellites? If Himawari scans NSW every 10 minutes, is each scan an "overpass" with its own 1-minute clock? If YES, then the 7-15 minute Himawari latency means we can never score on Himawari for the 1-minute metric, only for characterization. If NO (geostationary is excluded from overpass scoring), then only LEO passes count.
-
-## 4. Must-Have vs Nice-to-Have Partnerships
-
-### MUST-HAVE
-1. **Geoscience Australia / DEA Hotspots** -- Access to near-real-time VIIRS/MODIS fire detections for NSW with ~17 min latency. This is operational and available via WFS without registration. Essential as our baseline VIIRS data source.
-   - Contact: earth.observation@ga.gov.au
-
-2. **JAXA P-Tree registration** -- Free registration for Himawari-9 NRT data. Essential for our primary geostationary feed.
-
-3. **NASA FIRMS MAP_KEY** -- Free API key for global active fire data. Essential for cross-validation and supplementary data.
-
-4. **AWS Account in us-east-1** -- Co-located with NODD data mirrors. Essential for low-latency Himawari and VIIRS data ingestion via SNS.
-
-### NICE-TO-HAVE (High Value)
-5. **Bureau of Meteorology VIIRS/HRPT direct broadcast** -- BoM operates HRPT stations in Melbourne and Darwin. If they share near-real-time VIIRS SDR/RDR data, we could run our own fire detection within minutes of overpass, potentially hitting the 1-minute window.
-   - Contact: satellites@bom.gov.au
-
-6. **CfAT/Viasat Real-Time Earth (Alice Springs)** -- Commercial ground station that receives LEO EO data. Could provide fastest VIIRS data path.
-
-7. **Landgate/WASTAC (Perth)** -- Near-real-time VIIRS/MODIS quick-look archive. May provide faster data than FIRMS for western NSW overpasses.
-
-### ASPIRATIONAL (Highest Risk, Highest Reward)
-8. **Geoscience Australia Alice Springs -- FarEarth Observer deployment** -- If GA permits us to run real-time Landsat processing at Alice Springs during the competition window, we could achieve <10 second Landsat fire detection. This would be a competition-defining capability, but requires significant institutional cooperation.
-
-9. **OroraTech partnership** -- Their commercial constellation (~16+ satellites) provides thermal fire detection with <10 min alerts. A data sharing agreement would give us an additional independent fire detection stream.
-
-## 5. Daily Observation Timeline (Typical Day, AEST)
+## 6. Daily Observation Timeline (Typical Day, AEST)
 
 ```
 00:00-01:00  Himawari continuous (6 scans) + GK-2A continuous
 01:00-03:00  VIIRS night passes (NOAA-21, S-NPP, NOAA-20) -- 3 passes
              BEST NIGHTTIME SCORING WINDOW
-02:00-03:00  FY-3D MERSI-II night pass
-05:30-06:30  FY-3E MERSI-LL early morning pass
 06:00        Sunrise (April NSW)
 09:00-10:00  Terra MODIS morning pass (drifted orbit)
-09:30-10:30  MetOp AVHRR passes
-10:00-11:00  Sentinel-3 SLSTR pass
 10:00-10:30  Landsat pass IF PATH ALIGNS (2-4 times in 2 weeks)
-10:30-11:00  Sentinel-2 pass IF TILE ALIGNS
 13:00-15:00  VIIRS day passes (NOAA-21, S-NPP, NOAA-20) -- 3 passes
              BEST DAYTIME SCORING WINDOW
-14:00-15:00  FY-3D MERSI-II day pass + Aqua MODIS
 17:00-17:30  Sunset (April NSW)
-17:30-18:30  FY-3E MERSI-LL evening pass
-21:30-22:30  MetOp AVHRR night passes + Terra MODIS night
-22:00-23:00  Sentinel-3 SLSTR night pass
 ```
 
 **Himawari-9 provides continuous coverage throughout, with 144 observations per day.**
 
 ### Estimated scoring opportunities per day:
-- Himawari: 144 scan cycles (but latency prevents 1-min scoring -- these count for 10-min characterization)
-- VIIRS: 6 passes (3 day + 3 night) -- highest value for 1-min scoring
-- MODIS: 4 passes (but 2 overlap with VIIRS timing)
-- Other LEO: 4-8 additional passes
-- Landsat/Sentinel-2: 0-1 (rare but extremely high value)
 
-**Total LEO scoring opportunities: ~10-18 per day**
+- **Himawari:** 144 scan cycles (too much latency for 1-min scoring; primary value is trigger + characterization)
+- **VIIRS:** 6 passes (3 day + 3 night) -- highest value scoring opportunities
+- **MODIS:** 4 passes (2 overlap with VIIRS timing) -- via FIRMS
+- **Landsat:** 0-1 per competition (rare but high value if it aligns) -- via FIRMS
 
-## 6. Himawari Strategy
+---
 
-### Primary: AWS NODD with SNS push notifications
-- Subscribe to NewHimawariNineObject SNS topic from us-east-1
-- Filter for fire-relevant bands (B07, B14, B15)
-- Process only NSW segments (Segment 8: ~21-32S, Segment 9: ~32-47S)
-- Run contextual + temporal fire detection
+## 7. Data Architecture
 
-### Supplementary: JAXA P-Tree
-- Register for access (free, commercial use permitted from Feb 2026)
-- Use as fallback if AWS NODD has gaps
-- Latency: 5-20 minutes
+### Primary: AWS NODD with SNS Push (Himawari)
 
-### GK-2A as independent check
-- AWS NODD mirror at noaa-gk2a-pds
-- Process same bands with same algorithm
-- Independent detection from a different viewing angle provides strong confirmation
+```
+SNS Topic (NewHimawariNineObject)
+    |
+    v
+SQS Queue (filtered for B07, B14, NSW segments)
+    |
+    v
+Processing Lambda/ECS
+    |
+    v
+Pass 0 (decode) -> Pass 1 (contextual detection) -> Alert Policy -> Event Store
+```
 
-### FY-4B as additional redundancy
-- Register at NSMC for FY-4B Fire/Hotspot product
-- 15-minute cadence
-- Use as tertiary check, not primary
+### Primary: Polling (DEA Hotspots + FIRMS)
 
-## 7. Direct Broadcast vs Cloud Mirrors vs FIRMS
+```
+Every 5 minutes:
+    DEA Hotspots WFS query (NSW bounding box) -> Parse GeoJSON -> Event Store
+    FIRMS API query (NSW bounding box) -> Parse CSV -> Event Store
+```
 
-| Sensor | Direct Broadcast | Cloud Mirror (AWS NODD) | FIRMS |
-|--------|-----------------|------------------------|-------|
-| Himawari-9 | N/A for us | PRIMARY PATH (7-15 min) | Backup (30+ min) |
-| VIIRS | BEST PATH if partnership works (5-15 min) | Available but latency uncertain | Backup only (hours) |
-| MODIS | Same as VIIRS | Same as VIIRS | Backup only (hours) |
-| GK-2A | N/A | SECONDARY PATH | N/A |
-| Landsat | BEST PATH via FarEarth (<10s) | Available but 4-6 hours | N/A for Australia |
+### Backup: JAXA P-Tree (Himawari)
 
-### Recommended architecture:
-1. **Himawari**: Cloud mirror (AWS NODD) with SNS push -- this is our fastest reliable path
-2. **VIIRS**: Pursue direct broadcast partnership with GA/BoM as primary; fall back to DEA Hotspots (~17 min) and FIRMS NRT (hours)
-3. **GK-2A**: Cloud mirror for independent confirmation
-4. **Landsat**: Standard USGS pipeline (4-6 hours) unless FarEarth partnership materializes
-5. **FIRMS**: Poll every 2-5 minutes as safety net for all sensors
-6. **DEA Hotspots**: Poll WFS every 10 minutes -- this is our most reliable Australian-specific data source requiring no partnerships
+If AWS NODD is down or latency is unacceptable:
+- Switch to JAXA P-Tree
+- Poll every 5 minutes for new Himawari data
+- Same downstream processing
+
+### GK-2A (Week 2)
+
+```
+Poll AWS NODD (noaa-gk2a-pds) for new files
+    |
+    v
+Same processing as Himawari
+    |
+    v
+Cross-check feed into Event Store (not separate pipeline)
+```
+
+---
+
+## 8. Must-Have vs Nice-to-Have Resources
+
+### Available Now (No Partnership Needed)
+
+| Resource | Access Path | Status |
+|----------|-----------|--------|
+| Himawari-9 data | AWS NODD S3 bucket + SNS | Public, available |
+| GK-2A data | AWS NODD S3 bucket | Public, available |
+| VIIRS/MODIS fire detections | DEA Hotspots WFS | Public, no registration |
+| VIIRS/MODIS fire detections | FIRMS API (MAP_KEY) | Free registration |
+| Himawari NRT data | JAXA P-Tree | Free registration |
+| AWS compute (us-east-1) | AWS account | Team account |
+
+### Partnership Emails Sent (Day 1, March 18)
+
+| Partner | Contact | What We Asked | Expected Response Time |
+|---------|---------|---------------|----------------------|
+| BoM | satellites@bom.gov.au | HimawariRequest Target Area + faster Himawari | 1-2 weeks |
+| OroraTech | sales contact | Trial/pilot during competition | 1 week |
+| GA | earth.observation@ga.gov.au | Faster DEA Hotspots or priority API | 1-2 weeks |
+
+### Infrastructure Requirements
+
+| Resource | Priority | Status |
+|----------|---------|--------|
+| AWS account in us-east-1 | Week 1 Day 1 | SET UP TODAY |
+| FIRMS MAP_KEY | Week 1 Day 1 | REGISTER TODAY |
+| JAXA P-Tree registration | Week 1 Day 1 | REGISTER TODAY |
+| Domain/hosting for judge portal | Week 1 Day 2-3 | Standard web deployment |
