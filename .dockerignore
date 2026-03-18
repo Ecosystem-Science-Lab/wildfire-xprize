@@ -1,0 +1,10 @@
+.git
+data/
+docs/
+context/
+meetings/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.claude/

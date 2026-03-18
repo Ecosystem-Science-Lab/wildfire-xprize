@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NAU Wildfire Detection System</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+        #header {
+            background: #1a1a2e; color: #fff; padding: 12px 20px;
+            display: flex; justify-content: space-between; align-items: center;
+            flex-wrap: wrap; gap: 8px;
+        }
+        #header h1 { font-size: 18px; font-weight: 600; }
+        #header-info { display: flex; gap: 16px; align-items: center; font-size: 13px; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+        .status-ok { background: #4caf50; }
+        .status-err { background: #f44336; }
+        .status-wait { background: #ff9800; }
+        #event-count { background: #e94560; padding: 2px 10px; border-radius: 12px; font-weight: 600; }
+        #map { height: calc(100vh - 48px); width: 100%; }
+        .btn { background: #16213e; color: #fff; border: 1px solid #555; padding: 4px 12px;
+               border-radius: 4px; cursor: pointer; font-size: 12px; text-decoration: none; }
+        .btn:hover { background: #0f3460; }
+        .leaflet-popup-content { font-size: 13px; line-height: 1.5; }
+        .popup-status { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+        .popup-row { display: flex; justify-content: space-between; gap: 12px; }
+        .popup-label { color: #666; }
+        .legend {
+            background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 6px;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.3); font-size: 12px; line-height: 20px;
+        }
+        .legend-item { display: flex; align-items: center; gap: 6px; }
+        .legend-circle { width: 14px; height: 14px; border-radius: 50%; border: 2px solid rgba(0,0,0,0.3); }
+        #refresh-indicator {
+            position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%);
+            background: rgba(0,0,0,0.7); color: #fff; padding: 4px 12px;
+            border-radius: 12px; font-size: 11px; display: none; z-index: 1000;
+        }
+        .leaflet-control-layers { font-size: 13px; }
+        .leaflet-control-layers-base label,
+        .leaflet-control-layers-overlays label { padding: 2px 0; }
+        /* Time slider */
+        .time-slider-control {
+            background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 6px;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.3); font-size: 12px; min-width: 280px;
+        }
+        .time-slider-control .ts-header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 6px; font-weight: 600;
+        }
+        .time-slider-control .ts-date { font-size: 14px; font-weight: 700; color: #1a1a2e; }
+        .time-slider-control input[type=range] { width: 100%; margin: 4px 0; cursor: pointer; }
+        .time-slider-control .ts-labels {
+            display: flex; justify-content: space-between; font-size: 10px; color: #888;
+        }
+        .time-slider-control .ts-play {
+            background: #1a1a2e; color: #fff; border: none; border-radius: 4px;
+            padding: 2px 8px; cursor: pointer; font-size: 11px;
+        }
+        .time-slider-control .ts-play:hover { background: #0f3460; }
+        .time-slider-control .ts-note { font-size: 10px; color: #999; margin-top: 4px; }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <h1>NAU Wildfire Detection System</h1>
+        <div id="header-info">
+            <span><span class="status-dot status-wait" id="status-dot"></span>
+            <span id="last-update">Connecting...</span></span>
+            <span id="event-count">0 events</span>
+            <a class="btn" href="/api/events/geojson" download="nau_fire_events.geojson">Download GeoJSON</a>
+        </div>
+    </div>
+    <div id="map"></div>
+    <div id="refresh-indicator">Refreshing...</div>
+
+    <script>
+        // === Simplified NSW boundary (key points along border) ===
+        const nswBoundary = {
+            "type": "Feature",
+            "properties": { "name": "New South Wales" },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    // NW corner, east along QLD border (~29°S)
+                    [141.00, -29.00], [142.50, -29.00], [144.00, -29.00], [145.50, -29.00],
+                    [147.00, -29.00], [148.50, -29.00], [150.00, -29.00], [151.00, -29.00],
+                    // QLD border turns NE to coast
+                    [151.50, -28.85], [152.00, -28.70], [152.50, -28.50], [153.00, -28.35],
+                    [153.55, -28.16],
+                    // East coast, south
+                    [153.60, -28.70], [153.42, -29.40], [153.30, -29.80],
+                    [153.15, -30.30], [153.05, -30.90], [152.95, -31.40],
+                    [152.70, -31.90], [152.50, -32.30], [152.17, -32.75],
+                    [151.80, -33.00], [151.65, -33.30], [151.30, -33.70],
+                    [151.20, -33.90], [151.05, -34.30], [150.85, -34.60],
+                    [150.70, -35.00], [150.50, -35.30], [150.20, -35.85],
+                    [150.10, -36.30], [150.00, -36.70], [149.98, -37.00],
+                    [149.95, -37.30], [149.98, -37.50],
+                    // Southern border — VIC border along Murray + coast
+                    [149.50, -37.35], [149.00, -37.10],
+                    [148.50, -36.85], [148.00, -36.60],
+                    [147.50, -36.40], [147.00, -36.25],
+                    [146.50, -36.10], [146.00, -35.95],
+                    [145.50, -35.90], [145.00, -35.85],
+                    [144.50, -35.65], [144.00, -35.50],
+                    [143.50, -35.30], [143.00, -35.10],
+                    [142.50, -34.85], [142.00, -34.60],
+                    [141.50, -34.30], [141.00, -34.00],
+                    // West border — straight line back to NW corner
+                    [141.00, -33.00], [141.00, -32.00], [141.00, -31.00],
+                    [141.00, -30.00], [141.00, -29.00]
+                ]]
+            }
+        };
+
+        // === Base layers ===
+        const terrain = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+            maxZoom: 17,
+            attribution: '&copy; OpenTopoMap'
+        });
+
+        const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap'
+        });
+
+        const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            maxZoom: 18,
+            attribution: '&copy; Esri, Maxar, Earthstar'
+        });
+
+        const darkMap = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            maxZoom: 19,
+            attribution: '&copy; CARTO'
+        });
+
+        const sentinel2 = L.tileLayer('https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2021_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg', {
+            maxZoom: 15,
+            opacity: 0.8,
+            attribution: '&copy; EOX / Sentinel-2 Cloudless'
+        });
+
+        // === Time-aware overlay layers (NASA GIBS WMS with TIME param) ===
+        function todayStr() {
+            return new Date().toISOString().slice(0, 10);
+        }
+
+        function makeGibsWms(layerName, opts = {}) {
+            return L.tileLayer.wms('https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi', {
+                layers: layerName,
+                format: 'image/png',
+                transparent: true,
+                time: todayStr(),
+                ...opts,
+                attribution: 'NASA GIBS'
+            });
+        }
+
+        // Time-aware layers — these get updated when the slider moves
+        const timeAwareLayers = {};
+
+        timeAwareLayers['Himawari Visible'] = makeGibsWms('Himawari_AHI_Band3_Geo_Color', { opacity: 0.6 });
+        timeAwareLayers['Himawari IR (Band 13)'] = makeGibsWms('Himawari_AHI_Band13_Clean_Infrared', { opacity: 0.5 });
+        timeAwareLayers['MODIS True Color (Terra)'] = makeGibsWms('MODIS_Terra_CorrectedReflectance_TrueColor', { opacity: 0.7 });
+        timeAwareLayers['MODIS True Color (Aqua)'] = makeGibsWms('MODIS_Aqua_CorrectedReflectance_TrueColor', { opacity: 0.7 });
+        timeAwareLayers['VIIRS True Color'] = makeGibsWms('VIIRS_SNPP_CorrectedReflectance_TrueColor', { opacity: 0.7 });
+        timeAwareLayers['VIIRS Nighttime Lights'] = makeGibsWms('VIIRS_SNPP_DayNightBand_ENCC', { opacity: 0.5 });
+
+        // Initialize map
+        const map = L.map('map', {
+            center: [-33.0, 147.5],
+            zoom: 6,
+            layers: [terrain]
+        });
+
+        // NSW boundary polygon
+        L.geoJSON(nswBoundary, {
+            style: {
+                color: '#ff9800',
+                weight: 2,
+                fillOpacity: 0.03,
+                fillColor: '#ff9800',
+                dashArray: '6 3'
+            }
+        }).addTo(map);
+
+        // Layer control
+        const baseLayers = {
+            'Terrain': terrain,
+            'Street Map': osm,
+            'Satellite (Esri)': satellite,
+            'Sentinel-2 Cloudless': sentinel2,
+            'Dark': darkMap
+        };
+
+        L.control.layers(baseLayers, timeAwareLayers, { collapsed: true, position: 'topright' }).addTo(map);
+
+        // === Time Slider Control ===
+        const TimeSlider = L.Control.extend({
+            options: { position: 'bottomleft' },
+            onAdd: function(map) {
+                const container = L.DomUtil.create('div', 'time-slider-control');
+                L.DomEvent.disableClickPropagation(container);
+                L.DomEvent.disableScrollPropagation(container);
+
+                // Date range: last 7 days to today
+                const now = new Date();
+                const minDate = new Date(now);
+                minDate.setDate(minDate.getDate() - 7);
+
+                const minStamp = minDate.getTime();
+                const maxStamp = now.getTime();
+                const step = 86400000; // 1 day in ms
+
+                container.innerHTML = `
+                    <div class="ts-header">
+                        <span>Imagery Date</span>
+                        <button class="ts-play" id="ts-play-btn" title="Animate">&#9654; Play</button>
+                    </div>
+                    <div class="ts-date" id="ts-date-display">${todayStr()}</div>
+                    <input type="range" id="ts-slider" min="${minStamp}" max="${maxStamp}"
+                           value="${maxStamp}" step="${step}" />
+                    <div class="ts-labels">
+                        <span>${minDate.toISOString().slice(5,10)}</span>
+                        <span>Today</span>
+                    </div>
+                    <div class="ts-note">Affects satellite overlay layers</div>
+                `;
+
+                return container;
+            }
+        });
+
+        new TimeSlider().addTo(map);
+
+        // Time slider logic
+        let animInterval = null;
+
+        document.addEventListener('input', function(e) {
+            if (e.target.id === 'ts-slider') {
+                const dateStr = new Date(parseInt(e.target.value)).toISOString().slice(0, 10);
+                document.getElementById('ts-date-display').textContent = dateStr;
+                updateLayerTimes(dateStr);
+            }
+        });
+
+        document.addEventListener('click', function(e) {
+            if (e.target.id === 'ts-play-btn') {
+                toggleAnimation();
+            }
+        });
+
+        function updateLayerTimes(dateStr) {
+            for (const [name, layer] of Object.entries(timeAwareLayers)) {
+                if (map.hasLayer(layer)) {
+                    layer.setParams({ time: dateStr }, false);
+                }
+                // Also update the stored param so newly added layers use current time
+                layer.wmsParams.time = dateStr;
+            }
+        }
+
+        function toggleAnimation() {
+            const btn = document.getElementById('ts-play-btn');
+            const slider = document.getElementById('ts-slider');
+
+            if (animInterval) {
+                clearInterval(animInterval);
+                animInterval = null;
+                btn.innerHTML = '&#9654; Play';
+                return;
+            }
+
+            btn.innerHTML = '&#9724; Stop';
+            const min = parseInt(slider.min);
+            const max = parseInt(slider.max);
+            const step = parseInt(slider.step);
+
+            // Start from beginning
+            slider.value = min;
+            const dateStr = new Date(min).toISOString().slice(0, 10);
+            document.getElementById('ts-date-display').textContent = dateStr;
+            updateLayerTimes(dateStr);
+
+            animInterval = setInterval(() => {
+                let val = parseInt(slider.value) + step;
+                if (val > max) {
+                    val = min; // loop
+                }
+                slider.value = val;
+                const d = new Date(val).toISOString().slice(0, 10);
+                document.getElementById('ts-date-display').textContent = d;
+                updateLayerTimes(d);
+            }, 1500); // 1.5s per frame
+        }
+
+        // When a time-aware layer is added to the map, apply current slider time
+        map.on('overlayadd', function(e) {
+            const slider = document.getElementById('ts-slider');
+            if (slider) {
+                const dateStr = new Date(parseInt(slider.value)).toISOString().slice(0, 10);
+                if (e.layer && e.layer.wmsParams) {
+                    e.layer.setParams({ time: dateStr }, false);
+                }
+            }
+        });
+
+        // Legend
+        const legend = L.control({ position: 'bottomright' });
+        legend.onAdd = function() {
+            const div = L.DomUtil.create('div', 'legend');
+            div.innerHTML = `
+                <div style="font-weight:600; margin-bottom:4px;">Fire Events</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#d32f2f"></div> Confirmed</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#ff9800"></div> Likely</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#fdd835"></div> Provisional</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#9e9e9e"></div> Retracted</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#4caf50"></div> Monitoring</div>
+            `;
+            return div;
+        };
+        legend.addTo(map);
+
+        // Status colors
+        const STATUS_COLORS = {
+            CONFIRMED: '#d32f2f',
+            LIKELY: '#ff9800',
+            PROVISIONAL: '#fdd835',
+            RETRACTED: '#9e9e9e',
+            MONITORING: '#4caf50',
+            CLOSED: '#616161'
+        };
+
+        const STATUS_RADIUS = {
+            CONFIRMED: 12,
+            LIKELY: 10,
+            PROVISIONAL: 8,
+            RETRACTED: 6,
+            MONITORING: 10,
+            CLOSED: 6
+        };
+
+        let markersLayer = L.layerGroup().addTo(map);
+
+        function formatAEST(utcStr) {
+            try {
+                const d = new Date(utcStr);
+                return d.toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour12: false });
+            } catch {
+                return utcStr;
+            }
+        }
+
+        async function loadEvents() {
+            const indicator = document.getElementById('refresh-indicator');
+            indicator.style.display = 'block';
+
+            try {
+                const resp = await fetch('/api/events');
+                const events = await resp.json();
+
+                markersLayer.clearLayers();
+
+                events.forEach(evt => {
+                    const color = STATUS_COLORS[evt.status] || '#999';
+                    const radius = STATUS_RADIUS[evt.status] || 8;
+
+                    const marker = L.circleMarker([evt.centroid_lat, evt.centroid_lon], {
+                        radius: radius,
+                        fillColor: color,
+                        color: 'rgba(0,0,0,0.4)',
+                        weight: 2,
+                        fillOpacity: 0.85
+                    });
+
+                    marker.bindPopup(`
+                        <div class="popup-status" style="color:${color}">
+                            ${evt.status}
+                        </div>
+                        <div class="popup-row"><span class="popup-label">Event ID:</span> <span>${evt.id}</span></div>
+                        <div class="popup-row"><span class="popup-label">First detected:</span> <span>${formatAEST(evt.first_detection_time)}</span></div>
+                        <div class="popup-row"><span class="popup-label">Latest:</span> <span>${formatAEST(evt.latest_detection_time)}</span></div>
+                        <div class="popup-row"><span class="popup-label">Detections:</span> <span>${evt.detection_count}</span></div>
+                        <div class="popup-row"><span class="popup-label">Sources:</span> <span>${evt.source_set}</span></div>
+                        <div class="popup-row"><span class="popup-label">Max FRP:</span> <span>${evt.max_frp != null ? evt.max_frp.toFixed(1) + ' MW' : 'N/A'}</span></div>
+                        <div class="popup-row"><span class="popup-label">Confidence:</span> <span>${evt.max_confidence}</span></div>
+                        <div class="popup-row"><span class="popup-label">Location:</span> <span>${evt.centroid_lat.toFixed(4)}, ${evt.centroid_lon.toFixed(4)}</span></div>
+                        <div class="popup-row"><span class="popup-label">Uncertainty:</span> <span>${evt.location_uncertainty_m}m</span></div>
+                    `);
+
+                    // Uncertainty circle
+                    L.circle([evt.centroid_lat, evt.centroid_lon], {
+                        radius: evt.location_uncertainty_m,
+                        color: color,
+                        fillColor: color,
+                        fillOpacity: 0.08,
+                        weight: 1,
+                        dashArray: '4 4'
+                    }).addTo(markersLayer);
+
+                    marker.addTo(markersLayer);
+                });
+
+                document.getElementById('event-count').textContent = events.length + ' event' + (events.length !== 1 ? 's' : '');
+                document.getElementById('last-update').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+                document.getElementById('status-dot').className = 'status-dot status-ok';
+
+            } catch (err) {
+                console.error('Failed to load events:', err);
+                document.getElementById('status-dot').className = 'status-dot status-err';
+                document.getElementById('last-update').textContent = 'Connection error';
+            }
+
+            indicator.style.display = 'none';
+        }
+
+        loadEvents();
+        setInterval(loadEvents, 60000);
+    </script>
+</body>
+</html>
