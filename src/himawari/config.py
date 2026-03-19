@@ -14,29 +14,51 @@ class CUSUMConfig(BaseModel):
     enabled: bool = True
 
     # --- Kalman filter ---
-    # Initial diagonal variance for [T_mean, a1, b1, a2, b2]
-    initial_variance: list[float] = [25.0, 4.0, 4.0, 1.0, 1.0]
+    # Initial diagonal variance for [T_mean, a1, b1, a2, b2, beta]
+    initial_variance: list[float] = [25.0, 4.0, 4.0, 1.0, 1.0, 1.0]
     # Process noise std per parameter per time step.
     # Deliberately slow adaptation so the model can't chase fire anomalies.
     # Mean drifts ~0.001K/step = 0.14K/day (vs 1.4K/day before).
-    process_noise_std: list[float] = [0.001, 0.0001, 0.0001, 0.00005, 0.00005]
+    # 6th element (beta, BT14 anomaly covariate) has slow process noise.
+    process_noise_std: list[float] = [0.001, 0.0001, 0.0001, 0.00005, 0.00005, 0.0001]
     # Observation noise variance (K^2) — daytime vs nighttime
     R_day: float = 0.25
     R_night: float = 0.09
     # If z-score exceeds this, skip Kalman update (fire contamination gate)
-    fire_gate_sigma: float = 3.0
+    fire_gate_sigma: float = 2.0
     # Minimum clear-sky observations before CUSUM is activated for a pixel
     min_init_observations: int = 48  # ~8 hours of clear sky at 10-min cadence
 
     # --- CUSUM decision rule ---
-    k_ref: float = 0.5          # Reference value (sigma units). ARL₀ ≈ exp(2kh)/(2k²)
+    k_ref: float = 0.5          # Reference value (sigma units) — slow CUSUM for small fires
     h_threshold: float = 12.0   # Decision threshold (sigma units). k=0.5,h=12 → ARL₀ ≈ 325K frames
+    k_ref_fast: float = 1.5     # Reference value for fast CUSUM — large fires in minutes
+    h_threshold_fast: float = 5.0  # Decision threshold for fast CUSUM
     tau_decay_hours: float = 3.0  # Exponential decay time constant during cloud gaps
+
+    # --- BT14 EMA ---
+    bt14_ema_tau_hours: float = 4.0  # EMA time constant for BT14 background
+
+    # --- BT14 rejection ---
+    bt14_rejection_threshold: float = 3.0  # Suppress if BT14 also anomalous
+    bt14_rejection_max: float = 6.0  # Don't suppress extreme BT14 (could be large fire)
 
     # --- Alert criteria ---
     anomaly_z_threshold: float = 1.0   # z-score above which a frame counts as anomalous
     min_consecutive_anomalies: int = 6  # ~1 hour of consistent anomalies at 10-min cadence
     require_adjacent: bool = True       # Require >= 1 neighboring pixel also flagged
+
+    # --- Bayesian probability parameters ---
+    fire_prior: float = 1e-5           # Prior P(fire) per pixel per frame
+    cusum_to_logodds_scale: float = 2.0  # Scale factor: log_odds += scale * S_max
+    min_kalman_weight: float = 0.01    # Minimum Kalman gain scaling (prevents total freeze)
+    detection_probability_threshold: float = 0.5  # P(fire) threshold for candidate detection
+    display_probability_threshold: float = 0.05   # P(fire) threshold for portal display
+
+    # --- Training data store ---
+    training_store_enabled: bool = False  # Enable per-frame training data recording
+    training_store_dir: str = "data/training"  # Directory for parquet training files
+    training_store_background_sample_rate: float = 0.01  # Fraction of background pixels to sample
 
     # --- State persistence ---
     state_file: str = "data/cusum_state.npz"

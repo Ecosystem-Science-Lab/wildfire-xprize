@@ -14,6 +14,7 @@ from ..dedup import ingest_batch
 from .config import HimawariConfig
 from .converter import fire_pixels_to_detections
 from .cusum import CUSUMTemporalDetector, cusum_to_detections, merge_detections
+from .training_store import TrainingStore
 from .decoder import decode_hsd_to_bt
 from .detection import FireDetectionResult, detect_fires
 from .downloader import download_segments, list_segment_keys
@@ -32,6 +33,10 @@ _temporal_filter_cfg_hash: Optional[int] = None
 # per-pixel Kalman and CUSUM state. Initialized on first use.
 _cusum_detector: Optional[CUSUMTemporalDetector] = None
 _cusum_grid_key: Optional[tuple] = None  # (shape, cusum_config_hash)
+
+# Module-level training store. Persists across observations to buffer
+# training data within a single day. Initialized on first use.
+_training_store: Optional[TrainingStore] = None
 
 
 def _get_temporal_filter(cfg: HimawariConfig) -> TemporalFilter:
@@ -83,6 +88,8 @@ def _get_cusum_detector(
     cfg_hash = hash((
         cusum_cfg.k_ref,
         cusum_cfg.h_threshold,
+        cusum_cfg.k_ref_fast,
+        cusum_cfg.h_threshold_fast,
         cusum_cfg.fire_gate_sigma,
         cusum_cfg.min_init_observations,
         cusum_cfg.tau_decay_hours,
@@ -93,6 +100,13 @@ def _get_cusum_detector(
         tuple(cusum_cfg.process_noise_std),
         cusum_cfg.R_day,
         cusum_cfg.R_night,
+        cusum_cfg.bt14_ema_tau_hours,
+        cusum_cfg.bt14_rejection_threshold,
+        cusum_cfg.bt14_rejection_max,
+        cusum_cfg.fire_prior,
+        cusum_cfg.cusum_to_logodds_scale,
+        cusum_cfg.min_kalman_weight,
+        cusum_cfg.detection_probability_threshold,
     ))
     grid_key = (grid_shape, cfg_hash)
 
@@ -231,10 +245,23 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
             is_day_flat,
             obs_time_unix,
         )
+
+        # Extract fire probability stats for reporting
+        fp = cusum_result.get("fire_probability")
+        max_prob = float(np.nanmax(fp)) if fp is not None and np.any(np.isfinite(fp)) else 0.0
+        n_display = 0
+        if fp is not None:
+            n_display = int(np.sum(
+                np.isfinite(fp) & (fp >= cfg.cusum.display_probability_threshold)
+            ))
+
         cusum_stats = {
             "n_candidates": cusum_result["n_candidates"],
+            "n_bt14_rejected": cusum_result["n_bt14_rejected"],
             "n_initialized": cusum_result["n_initialized"],
             "initialized_pct": round(cusum.initialized_fraction * 100, 1),
+            "max_fire_probability": round(max_prob, 6),
+            "n_display_threshold": n_display,
             "timing_ms": cusum_result["timing_ms"],
         }
         timings["cusum"] = round((time.monotonic() - t) * 1000, 1)
@@ -251,6 +278,48 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
                 result.sza.ravel(),
                 cfg,
             )
+
+        # Record training data if enabled
+        if cfg.cusum.training_store_enabled:
+            global _training_store
+            if _training_store is None:
+                _training_store = TrainingStore(
+                    output_dir=cfg.cusum.training_store_dir,
+                    background_sample_rate=cfg.cusum.training_store_background_sample_rate,
+                )
+            diag = cusum_result.get("diagnostics", {})
+            try:
+                # Compute predicted BTD for training features
+                # btd_predicted = btd_observed - residual * sigma
+                # We approximate: btd_predicted = btd - (z * sigma) but we
+                # don't have sigma readily; use btd - innovation instead.
+                # Simpler: btd_predicted = btd_flat - innovation residual (unnormalized)
+                # For now, use btd_flat - z_scores * sqrt(R) as approximation
+                btd_pred_approx = btd_flat - np.where(
+                    np.isfinite(cusum_result["residuals"]),
+                    cusum_result["residuals"],
+                    0.0,
+                ).astype(np.float64) * np.sqrt(np.where(is_day_flat, cfg.cusum.R_day, cfg.cusum.R_night))
+
+                _training_store.record_frame(
+                    obs_time=obs_time,
+                    lats=lats.ravel(),
+                    lons=lons.ravel(),
+                    bt7=bt7.ravel(),
+                    bt14=bt14.ravel(),
+                    btd=btd_flat,
+                    btd_predicted=btd_pred_approx.astype(np.float32),
+                    z_scores=cusum_result["residuals"],
+                    fire_prob=cusum_result["fire_probability"],
+                    cusum_slow=diag.get("S_slow", cusum_result["cusum_values_slow"]),
+                    cusum_fast=diag.get("S_fast", cusum_result["cusum_values_fast"]),
+                    bt14_anomaly=diag.get("bt14_anomaly", np.zeros_like(btd_flat, dtype=np.float32)),
+                    kalman_weight=diag.get("kalman_weight", np.ones_like(btd_flat, dtype=np.float32)),
+                    cloud_mask=~clear_flat,
+                    is_day=is_day_flat,
+                )
+            except Exception:
+                logger.warning("Failed to record training data", exc_info=True)
 
         # Persist state periodically
         if cfg.cusum.save_interval > 0 and cusum.frame_count % cfg.cusum.save_interval == 0:
