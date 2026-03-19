@@ -44,6 +44,9 @@ class HimawariConfig(BaseModel):
     contextual_floor_night_bt7_k: float = 295.0
     # Minimum background std to prevent false positives in homogeneous terrain
     min_background_std_k: float = 2.0
+    # BT14 contextual offset — daytime only (VNP14IMG Step 8: BT5 > BT5B + δ5B + offset)
+    # Negative value = weak test (BT14 just needs to be roughly at/above background)
+    bt14_contextual_offset_k: float = -4.0
 
     # --- Background fire exclusion (excluded from bg stats, not flagged as fire) ---
     bg_fire_day_bt7_k: float = 335.0
@@ -66,3 +69,10 @@ class HimawariConfig(BaseModel):
 
     # Day/night SZA boundary
     sza_day_night_deg: float = 85.0
+
+    # --- Temporal persistence filter ---
+    temporal_filter_enabled: bool = True
+    temporal_window_size: int = 3  # Number of recent frames to buffer
+    temporal_min_persistence: int = 2  # Min frames a pixel must appear in
+    temporal_distance_threshold_km: float = 4.0  # "Same pixel" matching radius
+    temporal_bypass_high_confidence: bool = True  # HIGH (absolute) skip filter

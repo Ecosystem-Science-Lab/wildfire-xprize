@@ -10,6 +10,7 @@ import numpy as np
 from scipy.ndimage import uniform_filter
 
 from .config import HimawariConfig
+from .static_masks import compute_industrial_mask, compute_water_mask
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class FireDetectionResult:
     n_contextual: int = 0
     n_glint_downgraded: int = 0
     n_water_rejected: int = 0
+    n_industrial_downgraded: int = 0
     n_insufficient_bg: int = 0
     timing_ms: dict = field(default_factory=dict)
 
@@ -96,27 +98,8 @@ def _compute_glint_angle(
     return glint_angle.astype(np.float32)
 
 
-def _compute_water_mask(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
-    """Simple water mask based on distance to coast.
 
-    Uses a coarse check: reject pixels that are clearly ocean based on
-    NSW's coastline. Pixels east of the coast + small buffer are water.
-    This is a rough approximation; a proper land/sea mask would be better.
 
-    Returns boolean array — True = water pixel.
-    """
-    # NSW coastline approximation: east boundary varies by latitude
-    # Simple model: coast is roughly at these longitudes
-    # -28 to -33: ~153.5°E
-    # -33 to -37: ~151°E (Sydney to border region)
-    # -37 to -38: ~150°E (far south)
-    # Add 0.05° buffer (~5km) for coastal pixels
-    coast_lon = np.where(
-        lats > -33.0,
-        153.6,
-        np.where(lats > -37.0, 151.5, 150.3),
-    )
-    return lons > coast_lon
 
 
 def detect_fires(
@@ -160,9 +143,9 @@ def detect_fires(
         sza=sza,
     )
 
-    # --- Step 0b: Water mask ---
+    # --- Step 0b: Water mask (hybrid: global-land-mask ocean + GSHHS inland) ---
     t1 = time.monotonic()
-    water_mask = _compute_water_mask(lats, lons)
+    water_mask = compute_water_mask(lats, lons)
     valid_land = valid_mask & (~water_mask)
     result.n_water_rejected = int(np.sum(valid_mask & water_mask))
     timings["water_mask"] = round((time.monotonic() - t1) * 1000, 1)
@@ -209,7 +192,7 @@ def detect_fires(
         logger.info(
             "Detection complete: %d absolute, 0 candidates, 0 contextual "
             "(%d water, %d glint rejected)",
-            result.n_absolute, result.n_water_rejected, result.n_glint_rejected,
+            result.n_absolute, result.n_water_rejected, result.n_glint_downgraded,
         )
         result.n_fires = result.n_absolute
         return result
@@ -235,6 +218,8 @@ def detect_fires(
     bg_bt7_std = np.full(bt7.shape, np.nan, dtype=np.float32)
     bg_btd_mean = np.full(bt7.shape, np.nan, dtype=np.float32)
     bg_btd_std = np.full(bt7.shape, np.nan, dtype=np.float32)
+    bg_bt14_mean = np.full(bt7.shape, np.nan, dtype=np.float32)
+    bg_bt14_std = np.full(bt7.shape, np.nan, dtype=np.float32)
     bg_sufficient = np.zeros(bt7.shape, dtype=bool)
 
     for win_size in cfg.background_window_sizes:
@@ -278,12 +263,26 @@ def detect_fires(
         std_btd = np.sqrt(var_btd).astype(np.float32)
         std_btd = np.maximum(std_btd, cfg.min_background_std_k)  # Floor
 
+        # BT14 background stats (for longwave contextual test, float64 for precision)
+        bt14_bg = np.where(bg_mask, bt14, 0.0).astype(np.float64)
+        bt14_sum = uniform_filter(bt14_bg, size=win_size, mode="constant", cval=0.0) * total_pixels
+        bt14_sq = np.where(bg_mask, bt14.astype(np.float64) ** 2, 0.0)
+        bt14_sq_sum = uniform_filter(bt14_sq, size=win_size, mode="constant", cval=0.0) * total_pixels
+
+        mean_bt14 = (bt14_sum / safe_count).astype(np.float32)
+        var_bt14 = bt14_sq_sum / safe_count - (bt14_sum / safe_count) ** 2
+        var_bt14 = np.maximum(var_bt14, 0.0)
+        std_bt14 = np.sqrt(var_bt14).astype(np.float32)
+        std_bt14 = np.maximum(std_bt14, cfg.min_background_std_k)  # Floor
+
         # Update where newly sufficient
         new_sufficient = sufficient & (~bg_sufficient)
         bg_bt7_mean = np.where(new_sufficient, mean_bt7, bg_bt7_mean)
         bg_bt7_std = np.where(new_sufficient, std_bt7, bg_bt7_std)
         bg_btd_mean = np.where(new_sufficient, mean_btd, bg_btd_mean)
         bg_btd_std = np.where(new_sufficient, std_btd, bg_btd_std)
+        bg_bt14_mean = np.where(new_sufficient, mean_bt14, bg_bt14_mean)
+        bg_bt14_std = np.where(new_sufficient, std_bt14, bg_bt14_std)
         bg_sufficient = bg_sufficient | sufficient
 
     timings["background"] = round((time.monotonic() - t1) * 1000, 1)
@@ -304,6 +303,14 @@ def detect_fires(
     )
     contextual_bt7_floor = bt7 >= bt7_floor
 
+    # BT14 longwave contextual test (daytime only, VNP14IMG Step 8):
+    # BT14 must be roughly at or above background — catches MIR-only anomalies
+    # (e.g. reflected sunlight boosting BT7 but not BT14).
+    # Night: test is unconditionally True (not required per reference algorithm).
+    contextual_bt14 = (~is_day) | (
+        bt14 > (bg_bt14_mean + bg_bt14_std + cfg.bt14_contextual_offset_k)
+    )
+
     contextual_fire = (
         candidates
         & bg_sufficient
@@ -311,6 +318,7 @@ def detect_fires(
         & contextual_btd_sigma
         & contextual_btd_floor
         & contextual_bt7_floor
+        & contextual_bt14
     )
     result.n_contextual = int(np.sum(contextual_fire))
 
@@ -343,6 +351,13 @@ def detect_fires(
     result.fire_mask[glint_downgrade] = 1  # NOMINAL → LOW
     result.n_glint_downgraded = int(np.sum(glint_downgrade))
 
+    # Industrial site downgrade: NOMINAL→LOW near known thermal sources
+    # (real fires CAN start at industrial sites, so don't reject — just downgrade)
+    industrial_mask = compute_industrial_mask(lats, lons)
+    industrial_downgrade = (result.fire_mask >= 2) & industrial_mask
+    result.fire_mask[industrial_downgrade] = 1  # NOMINAL/HIGH → LOW
+    result.n_industrial_downgraded = int(np.sum(industrial_downgrade))
+
     timings["confidence"] = round((time.monotonic() - t1) * 1000, 1)
 
     result.n_fires = result.n_absolute + result.n_contextual
@@ -351,13 +366,14 @@ def detect_fires(
 
     logger.info(
         "Detection complete: %d absolute, %d candidates, %d contextual, %d total fires "
-        "(%d water rejected, %d glint downgraded, %d insufficient bg) (%.0fms)",
+        "(%d water, %d glint↓, %d industrial↓, %d insuff bg) (%.0fms)",
         result.n_absolute,
         result.n_candidates,
         result.n_contextual,
         result.n_fires,
         result.n_water_rejected,
         result.n_glint_downgraded,
+        result.n_industrial_downgraded,
         result.n_insufficient_bg,
         timings["total"],
     )

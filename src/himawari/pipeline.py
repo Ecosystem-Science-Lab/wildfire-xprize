@@ -6,6 +6,7 @@ import logging
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -16,8 +17,45 @@ from .decoder import decode_hsd_to_bt
 from .detection import FireDetectionResult, detect_fires
 from .downloader import download_segments, list_segment_keys
 from .masks import compute_cloud_adjacency, compute_cloud_mask, compute_nsw_mask
+from .persistence import TemporalFilter
 
 logger = logging.getLogger(__name__)
+
+# Module-level temporal filter instance. Persists across observations to
+# maintain the rolling buffer. Initialized on first use via _get_filter().
+_temporal_filter: Optional[TemporalFilter] = None
+_temporal_filter_cfg_hash: Optional[int] = None
+
+
+def _get_temporal_filter(cfg: HimawariConfig) -> TemporalFilter:
+    """Get or create the module-level TemporalFilter, reinitializing if config changed."""
+    global _temporal_filter, _temporal_filter_cfg_hash
+
+    cfg_hash = hash((
+        cfg.temporal_window_size,
+        cfg.temporal_min_persistence,
+        cfg.temporal_distance_threshold_km,
+        cfg.temporal_bypass_high_confidence,
+    ))
+
+    if _temporal_filter is None or _temporal_filter_cfg_hash != cfg_hash:
+        _temporal_filter = TemporalFilter(
+            window_size=cfg.temporal_window_size,
+            min_persistence=cfg.temporal_min_persistence,
+            distance_threshold_km=cfg.temporal_distance_threshold_km,
+            bypass_high_confidence=cfg.temporal_bypass_high_confidence,
+        )
+        _temporal_filter_cfg_hash = cfg_hash
+        logger.info(
+            "Temporal filter initialized: window=%d, min_persistence=%d, "
+            "distance=%.1fkm, bypass_high=%s",
+            cfg.temporal_window_size,
+            cfg.temporal_min_persistence,
+            cfg.temporal_distance_threshold_km,
+            cfg.temporal_bypass_high_confidence,
+        )
+
+    return _temporal_filter
 
 
 async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
@@ -106,6 +144,24 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
         result.fire_mask, bt7, bt14, lats, lons, obs_time, result.sza, cfg
     )
     timings["convert"] = round((time.monotonic() - t) * 1000, 1)
+    n_raw_detections = len(detections)
+
+    # Step 6b: Temporal persistence filter — reduces false positives by
+    # requiring fire pixels to appear in multiple consecutive frames.
+    # HIGH confidence (absolute threshold) detections bypass this filter.
+    filter_stats: dict = {}
+    if cfg.temporal_filter_enabled and detections:
+        t = time.monotonic()
+        tf = _get_temporal_filter(cfg)
+        detections, filter_stats = tf.filter_detections(detections, obs_time)
+        timings["temporal_filter"] = round((time.monotonic() - t) * 1000, 1)
+    elif cfg.temporal_filter_enabled:
+        # No detections, but still update the buffer with an empty frame
+        # so the window slides correctly.
+        t = time.monotonic()
+        tf = _get_temporal_filter(cfg)
+        detections, filter_stats = tf.filter_detections([], obs_time)
+        timings["temporal_filter"] = round((time.monotonic() - t) * 1000, 1)
 
     # Step 7: Ingest into event store
     t = time.monotonic()
@@ -115,8 +171,10 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
     timings["total"] = round((time.monotonic() - t_start) * 1000, 1)
 
     logger.info(
-        "Himawari observation %s processed: %d detections (%d new, %d dup) in %.1fs | %s",
+        "Himawari observation %s processed: %d detections → %d after filter "
+        "(%d new, %d dup) in %.1fs | %s",
         obs_timestamp,
+        n_raw_detections,
         len(detections),
         ingest_stats["new"],
         ingest_stats["duplicates"],
@@ -131,7 +189,9 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
         "n_absolute": result.n_absolute,
         "n_contextual": result.n_contextual,
         "n_candidates": result.n_candidates,
+        "n_raw_detections": n_raw_detections,
         "detections_new": ingest_stats["new"],
         "detections_dup": ingest_stats["duplicates"],
+        "temporal_filter": filter_stats,
         "timings_ms": timings,
     }
