@@ -3,6 +3,46 @@
 from pydantic import BaseModel
 
 
+class CUSUMConfig(BaseModel):
+    """Configuration for the CUSUM temporal fire detection module.
+
+    The CUSUM detector maintains a per-pixel Kalman-filtered harmonic model of
+    expected BTD (BT7 - BT14) at each time of day, and runs a one-sided upper
+    CUSUM on normalized residuals to flag persistent positive anomalies.
+    """
+
+    enabled: bool = True
+
+    # --- Kalman filter ---
+    # Initial diagonal variance for [T_mean, a1, b1, a2, b2]
+    initial_variance: list[float] = [25.0, 4.0, 4.0, 1.0, 1.0]
+    # Process noise std per parameter per time step.
+    # Deliberately slow adaptation so the model can't chase fire anomalies.
+    # Mean drifts ~0.001K/step = 0.14K/day (vs 1.4K/day before).
+    process_noise_std: list[float] = [0.001, 0.0001, 0.0001, 0.00005, 0.00005]
+    # Observation noise variance (K^2) — daytime vs nighttime
+    R_day: float = 0.25
+    R_night: float = 0.09
+    # If z-score exceeds this, skip Kalman update (fire contamination gate)
+    fire_gate_sigma: float = 3.0
+    # Minimum clear-sky observations before CUSUM is activated for a pixel
+    min_init_observations: int = 48  # ~8 hours of clear sky at 10-min cadence
+
+    # --- CUSUM decision rule ---
+    k_ref: float = 0.5          # Reference value (sigma units). ARL₀ ≈ exp(2kh)/(2k²)
+    h_threshold: float = 12.0   # Decision threshold (sigma units). k=0.5,h=12 → ARL₀ ≈ 325K frames
+    tau_decay_hours: float = 3.0  # Exponential decay time constant during cloud gaps
+
+    # --- Alert criteria ---
+    anomaly_z_threshold: float = 1.0   # z-score above which a frame counts as anomalous
+    min_consecutive_anomalies: int = 6  # ~1 hour of consistent anomalies at 10-min cadence
+    require_adjacent: bool = True       # Require >= 1 neighboring pixel also flagged
+
+    # --- State persistence ---
+    state_file: str = "data/cusum_state.npz"
+    save_interval: int = 1  # Save state every N observation frames
+
+
 class HimawariConfig(BaseModel):
     """Configuration for Himawari-9 AHI fire detection pipeline."""
 
@@ -76,3 +116,6 @@ class HimawariConfig(BaseModel):
     temporal_min_persistence: int = 2  # Min frames a pixel must appear in
     temporal_distance_threshold_km: float = 4.0  # "Same pixel" matching radius
     temporal_bypass_high_confidence: bool = True  # HIGH (absolute) skip filter
+
+    # --- CUSUM temporal detection ---
+    cusum: CUSUMConfig = CUSUMConfig()

@@ -13,11 +13,13 @@ import numpy as np
 from ..dedup import ingest_batch
 from .config import HimawariConfig
 from .converter import fire_pixels_to_detections
+from .cusum import CUSUMTemporalDetector, cusum_to_detections, merge_detections
 from .decoder import decode_hsd_to_bt
 from .detection import FireDetectionResult, detect_fires
 from .downloader import download_segments, list_segment_keys
 from .masks import compute_cloud_adjacency, compute_cloud_mask, compute_nsw_mask
 from .persistence import TemporalFilter
+from .static_masks import compute_industrial_mask, compute_water_mask
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,11 @@ logger = logging.getLogger(__name__)
 # maintain the rolling buffer. Initialized on first use via _get_filter().
 _temporal_filter: Optional[TemporalFilter] = None
 _temporal_filter_cfg_hash: Optional[int] = None
+
+# Module-level CUSUM detector. Persists across observations to maintain
+# per-pixel Kalman and CUSUM state. Initialized on first use.
+_cusum_detector: Optional[CUSUMTemporalDetector] = None
+_cusum_grid_key: Optional[tuple] = None  # (shape, cusum_config_hash)
 
 
 def _get_temporal_filter(cfg: HimawariConfig) -> TemporalFilter:
@@ -56,6 +63,68 @@ def _get_temporal_filter(cfg: HimawariConfig) -> TemporalFilter:
         )
 
     return _temporal_filter
+
+
+def _get_cusum_detector(
+    cfg: HimawariConfig,
+    grid_shape: tuple[int, int],
+    lats: np.ndarray,
+    lons: np.ndarray,
+    valid_mask: np.ndarray,
+) -> CUSUMTemporalDetector:
+    """Get or create the module-level CUSUMTemporalDetector.
+
+    Re-creates the detector if the grid shape or config changes.  On first
+    creation (or re-creation), attempts to load persisted state from disk.
+    """
+    global _cusum_detector, _cusum_grid_key
+
+    cusum_cfg = cfg.cusum
+    cfg_hash = hash((
+        cusum_cfg.k_ref,
+        cusum_cfg.h_threshold,
+        cusum_cfg.fire_gate_sigma,
+        cusum_cfg.min_init_observations,
+        cusum_cfg.tau_decay_hours,
+        cusum_cfg.anomaly_z_threshold,
+        cusum_cfg.min_consecutive_anomalies,
+        cusum_cfg.require_adjacent,
+        tuple(cusum_cfg.initial_variance),
+        tuple(cusum_cfg.process_noise_std),
+        cusum_cfg.R_day,
+        cusum_cfg.R_night,
+    ))
+    grid_key = (grid_shape, cfg_hash)
+
+    if _cusum_detector is not None and _cusum_grid_key == grid_key:
+        return _cusum_detector
+
+    # Build suppression mask (water + industrial) on the full grid
+    water = compute_water_mask(lats, lons)
+    industrial = compute_industrial_mask(lats, lons)
+    suppression = (water | industrial).ravel()
+
+    n_pixels = grid_shape[0] * grid_shape[1]
+    pixel_lons = lons.ravel().astype(np.float32)
+
+    _cusum_detector = CUSUMTemporalDetector(
+        n_pixels=n_pixels,
+        pixel_lons=pixel_lons,
+        cfg=cusum_cfg,
+        suppression_mask=suppression,
+    )
+    _cusum_detector.set_grid_shape(grid_shape[0], grid_shape[1])
+
+    # Try to restore persisted state
+    _cusum_detector.load_state()
+
+    _cusum_grid_key = grid_key
+    logger.info(
+        "CUSUM detector initialized: %d pixels, grid %s, %.1f%% already initialized",
+        n_pixels, grid_shape, _cusum_detector.initialized_fraction * 100,
+    )
+
+    return _cusum_detector
 
 
 async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
@@ -138,11 +207,68 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
     )
     timings["detection"] = round((time.monotonic() - t) * 1000, 1)
 
+    # Step 5b: CUSUM temporal detection (runs parallel to contextual)
+    cusum_stats: dict = {}
+    cusum_detections: list = []
+    if cfg.cusum.enabled:
+        t = time.monotonic()
+        cusum = _get_cusum_detector(cfg, bt7.shape, lats, lons, valid_mask)
+
+        # Flatten arrays for CUSUM (operates on 1-D arrays)
+        btd_flat = (bt7 - bt14).ravel()
+        bt14_flat_arr = bt14.ravel()
+        clear_flat = valid_mask.ravel()
+        is_day_flat = (result.sza < cfg.sza_day_night_deg).ravel()
+        obs_time_unix = obs_time.replace(
+            tzinfo=__import__("datetime").timezone.utc
+        ).timestamp() if obs_time.tzinfo is None else obs_time.timestamp()
+
+        cusum_result = await asyncio.to_thread(
+            cusum.update,
+            btd_flat,
+            bt14_flat_arr,
+            clear_flat,
+            is_day_flat,
+            obs_time_unix,
+        )
+        cusum_stats = {
+            "n_candidates": cusum_result["n_candidates"],
+            "n_initialized": cusum_result["n_initialized"],
+            "initialized_pct": round(cusum.initialized_fraction * 100, 1),
+            "timing_ms": cusum_result["timing_ms"],
+        }
+        timings["cusum"] = round((time.monotonic() - t) * 1000, 1)
+
+        # Convert CUSUM candidates to Detection objects
+        if cusum_result["n_candidates"] > 0:
+            cusum_detections = cusum_to_detections(
+                cusum_result,
+                lats.ravel(),
+                lons.ravel(),
+                bt7.ravel(),
+                bt14.ravel(),
+                obs_time,
+                result.sza.ravel(),
+                cfg,
+            )
+
+        # Persist state periodically
+        if cfg.cusum.save_interval > 0 and cusum.frame_count % cfg.cusum.save_interval == 0:
+            try:
+                cusum.save_state()
+            except Exception:
+                logger.warning("Failed to save CUSUM state", exc_info=True)
+
     # Step 6: Convert fire pixels to Detection objects (reuse SZA from detection)
     t = time.monotonic()
     detections = fire_pixels_to_detections(
         result.fire_mask, bt7, bt14, lats, lons, obs_time, result.sza, cfg
     )
+
+    # Merge contextual + CUSUM detections (dedup same-pixel, boost corroborated)
+    if cusum_detections:
+        detections = merge_detections(detections, cusum_detections)
+
     timings["convert"] = round((time.monotonic() - t) * 1000, 1)
     n_raw_detections = len(detections)
 
@@ -193,5 +319,6 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
         "detections_new": ingest_stats["new"],
         "detections_dup": ingest_stats["duplicates"],
         "temporal_filter": filter_stats,
+        "cusum": cusum_stats,
         "timings_ms": timings,
     }

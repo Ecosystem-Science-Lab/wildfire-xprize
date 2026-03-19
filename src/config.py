@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # Himawari pipeline
     himawari_enabled: bool = True
     poll_interval_himawari: int = 120
+    cusum_enabled: bool = True  # CUSUM temporal fire detection (within Himawari pipeline)
 
     # Display
     timezone_display: str = "Australia/Sydney"
