@@ -69,6 +69,28 @@
         }
         .time-slider-control .ts-play:hover { background: #0f3460; }
         .time-slider-control .ts-note { font-size: 10px; color: #999; margin-top: 4px; }
+        /* CUSUM status panel */
+        .cusum-status-control {
+            background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 6px;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.3); font-size: 12px; min-width: 240px;
+        }
+        .cusum-status-control .cs-title {
+            font-weight: 700; font-size: 11px; text-transform: uppercase;
+            color: #1a1a2e; letter-spacing: 0.5px; margin-bottom: 4px;
+        }
+        .cusum-status-control .cs-row {
+            display: flex; justify-content: space-between; gap: 8px;
+            padding: 1px 0; color: #444;
+        }
+        .cusum-status-control .cs-label { color: #888; }
+        .cusum-status-control .cs-value { font-weight: 600; }
+        .cusum-status-control .cs-inactive { color: #bbb; font-style: italic; }
+        /* Pulsing animation for high-probability CUSUM pixels */
+        @keyframes cusum-pulse {
+            0% { opacity: 0.9; }
+            50% { opacity: 0.5; }
+            100% { opacity: 0.9; }
+        }
     </style>
 </head>
 <body>
@@ -78,6 +100,7 @@
             <span><span class="status-dot status-wait" id="status-dot"></span>
             <span id="last-update">Connecting...</span></span>
             <span id="event-count">0 events</span>
+            <span id="cusum-header-status" style="color:#888; font-size:12px;">CUSUM: --</span>
             <a class="btn" href="/api/events/geojson" download="nau_fire_events.geojson">Download GeoJSON</a>
         </div>
     </div>
@@ -195,6 +218,9 @@
             }
         }).addTo(map);
 
+        // === CUSUM heatmap layer group ===
+        let cusumLayer = L.layerGroup();  // not added to map by default (toggleable)
+
         // Layer control
         const baseLayers = {
             'Terrain': terrain,
@@ -204,7 +230,11 @@
             'Dark': darkMap
         };
 
-        L.control.layers(baseLayers, timeAwareLayers, { collapsed: true, position: 'topright' }).addTo(map);
+        const overlayLayers = Object.assign({}, timeAwareLayers, {
+            'CUSUM Fire Probability': cusumLayer
+        });
+
+        L.control.layers(baseLayers, overlayLayers, { collapsed: true, position: 'topright' }).addTo(map);
 
         // Inject section labels into layer control
         {
@@ -345,6 +375,12 @@
                 <div class="legend-item"><div class="legend-circle" style="background:#fdd835"></div> Provisional</div>
                 <div class="legend-item"><div class="legend-circle" style="background:#9e9e9e"></div> Retracted</div>
                 <div class="legend-item"><div class="legend-circle" style="background:#4caf50"></div> Monitoring</div>
+                <div style="border-top:1px solid #ddd; margin:6px 0;"></div>
+                <div style="font-weight:600; margin-bottom:4px;">CUSUM P(fire)</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#fdd835; width:8px; height:8px;"></div> 5-20%</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#ff9800; width:10px; height:10px;"></div> 20-50%</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#ff5722; width:12px; height:12px;"></div> 50-80%</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#d32f2f; width:14px; height:14px;"></div> &gt;80%</div>
             `;
             return div;
         };
@@ -445,6 +481,144 @@
 
         loadEvents();
         setInterval(loadEvents, 60000);
+
+        // === CUSUM Status Panel Control ===
+        const CusumStatusPanel = L.Control.extend({
+            options: { position: 'topleft' },
+            onAdd: function(map) {
+                const container = L.DomUtil.create('div', 'cusum-status-control');
+                L.DomEvent.disableClickPropagation(container);
+                container.innerHTML = `
+                    <div class="cs-title">CUSUM Temporal Detector</div>
+                    <div class="cs-row"><span class="cs-label">Status:</span> <span class="cs-value cs-inactive" id="cs-status">Waiting for data</span></div>
+                    <div class="cs-row"><span class="cs-label">Initialized:</span> <span class="cs-value" id="cs-initialized">--</span></div>
+                    <div class="cs-row"><span class="cs-label">Pixels &gt;5%:</span> <span class="cs-value" id="cs-above-threshold">--</span></div>
+                    <div class="cs-row"><span class="cs-label">Max P(fire):</span> <span class="cs-value" id="cs-max-prob">--</span></div>
+                    <div class="cs-row"><span class="cs-label">Obs time:</span> <span class="cs-value" id="cs-obs-time">--</span></div>
+                `;
+                return container;
+            }
+        });
+        new CusumStatusPanel().addTo(map);
+
+        // === CUSUM Heatmap Loader ===
+        function cusumPixelStyle(probability) {
+            // Returns { color, radius, opacity } based on probability band
+            if (probability > 0.80) {
+                return { color: '#d32f2f', radius: 7, opacity: 0.9, pulsing: true };
+            } else if (probability > 0.50) {
+                return { color: '#ff5722', radius: 6, opacity: 0.8, pulsing: false };
+            } else if (probability > 0.20) {
+                return { color: '#ff9800', radius: 5, opacity: 0.65, pulsing: false };
+            } else {
+                // 0.05 - 0.20
+                return { color: '#fdd835', radius: 4, opacity: 0.45, pulsing: false };
+            }
+        }
+
+        // Track pulsing markers for animation
+        let cusumPulsingMarkers = [];
+        let cusumPulseInterval = null;
+
+        function startCusumPulse() {
+            if (cusumPulseInterval) return;
+            let phase = 0;
+            cusumPulseInterval = setInterval(() => {
+                phase = (phase + 1) % 20;
+                const opacity = 0.5 + 0.4 * Math.sin(phase * Math.PI / 10);
+                cusumPulsingMarkers.forEach(m => {
+                    m.setStyle({ fillOpacity: opacity });
+                });
+            }, 100);
+        }
+
+        function stopCusumPulse() {
+            if (cusumPulseInterval) {
+                clearInterval(cusumPulseInterval);
+                cusumPulseInterval = null;
+            }
+            cusumPulsingMarkers = [];
+        }
+
+        async function loadCusumHeatmap() {
+            try {
+                const resp = await fetch('/api/cusum/heatmap');
+                const data = await resp.json();
+
+                // Update status panel
+                const statusEl = document.getElementById('cs-status');
+                const initEl = document.getElementById('cs-initialized');
+                const aboveEl = document.getElementById('cs-above-threshold');
+                const maxProbEl = document.getElementById('cs-max-prob');
+                const obsTimeEl = document.getElementById('cs-obs-time');
+                const headerStatus = document.getElementById('cusum-header-status');
+
+                if (!data.obs_time) {
+                    statusEl.textContent = 'Waiting for data';
+                    statusEl.className = 'cs-value cs-inactive';
+                    initEl.textContent = '--';
+                    aboveEl.textContent = '--';
+                    maxProbEl.textContent = '--';
+                    obsTimeEl.textContent = '--';
+                    headerStatus.textContent = 'CUSUM: --';
+                    headerStatus.style.color = '#888';
+                    return;
+                }
+
+                statusEl.textContent = 'Active';
+                statusEl.className = 'cs-value';
+                statusEl.style.color = '#4caf50';
+                initEl.textContent = data.initialized_pct.toFixed(1) + '%';
+                aboveEl.textContent = data.n_above_display_threshold;
+                maxProbEl.textContent = (data.max_fire_probability * 100).toFixed(2) + '%';
+                obsTimeEl.textContent = formatAEST(data.obs_time);
+
+                // Header summary
+                headerStatus.textContent = 'CUSUM: ' + data.initialized_pct.toFixed(0) + '% init, ' + data.n_above_display_threshold + ' px >5%';
+                headerStatus.style.color = data.n_above_display_threshold > 0 ? '#ff9800' : '#8bc34a';
+
+                // Update heatmap layer
+                stopCusumPulse();
+                cusumLayer.clearLayers();
+
+                data.pixels.forEach(px => {
+                    const style = cusumPixelStyle(px.probability);
+                    const marker = L.circleMarker([px.lat, px.lon], {
+                        radius: style.radius,
+                        fillColor: style.color,
+                        color: style.color,
+                        weight: 1,
+                        fillOpacity: style.opacity,
+                        opacity: style.opacity
+                    });
+
+                    marker.bindPopup(`
+                        <div class="popup-status" style="color:${style.color}">CUSUM Detection</div>
+                        <div class="popup-row"><span class="popup-label">P(fire):</span> <span>${(px.probability * 100).toFixed(2)}%</span></div>
+                        <div class="popup-row"><span class="popup-label">S_slow:</span> <span>${px.s_slow}</span></div>
+                        <div class="popup-row"><span class="popup-label">S_fast:</span> <span>${px.s_fast}</span></div>
+                        <div class="popup-row"><span class="popup-label">Location:</span> <span>${px.lat}, ${px.lon}</span></div>
+                    `);
+
+                    marker.addTo(cusumLayer);
+
+                    if (style.pulsing) {
+                        cusumPulsingMarkers.push(marker);
+                    }
+                });
+
+                if (cusumPulsingMarkers.length > 0) {
+                    startCusumPulse();
+                }
+
+            } catch (err) {
+                console.error('Failed to load CUSUM heatmap:', err);
+            }
+        }
+
+        // Initial load and auto-refresh (every 2 minutes, matching Himawari poll interval)
+        loadCusumHeatmap();
+        setInterval(loadCusumHeatmap, 120000);
     </script>
 </body>
 </html>

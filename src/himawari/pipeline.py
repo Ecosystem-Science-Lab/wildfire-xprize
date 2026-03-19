@@ -38,6 +38,9 @@ _cusum_grid_key: Optional[tuple] = None  # (shape, cusum_config_hash)
 # training data within a single day. Initialized on first use.
 _training_store: Optional[TrainingStore] = None
 
+# Latest CUSUM result with coordinate arrays, exposed for the /api/cusum/heatmap endpoint.
+_latest_cusum_result: Optional[dict] = None
+
 
 def _get_temporal_filter(cfg: HimawariConfig) -> TemporalFilter:
     """Get or create the module-level TemporalFilter, reinitializing if config changed."""
@@ -265,6 +268,17 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
             "timing_ms": cusum_result["timing_ms"],
         }
         timings["cusum"] = round((time.monotonic() - t) * 1000, 1)
+
+        # Expose latest CUSUM result + coordinates for the heatmap API endpoint
+        global _latest_cusum_result
+        _latest_cusum_result = {
+            "cusum_result": cusum_result,
+            "lats_flat": lats.ravel().copy(),
+            "lons_flat": lons.ravel().copy(),
+            "obs_time": obs_time,
+            "cusum_stats": cusum_stats,
+            "display_probability_threshold": cfg.cusum.display_probability_threshold,
+        }
 
         # Convert CUSUM candidates to Detection objects
         if cusum_result["n_candidates"] > 0:
