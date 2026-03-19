@@ -43,6 +43,12 @@
         .leaflet-control-layers { font-size: 13px; }
         .leaflet-control-layers-base label,
         .leaflet-control-layers-overlays label { padding: 2px 0; }
+        .leaflet-control-layers-separator { border-top: 1px solid #ccc; margin: 6px 0; }
+        .layers-section-label {
+            font-weight: 700; font-size: 10px; text-transform: uppercase;
+            color: #888; letter-spacing: 0.5px; display: block;
+            padding: 4px 0 2px 0;
+        }
         /* Time slider */
         .time-slider-control {
             background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 6px;
@@ -199,6 +205,24 @@
         };
 
         L.control.layers(baseLayers, timeAwareLayers, { collapsed: true, position: 'topright' }).addTo(map);
+
+        // Inject section labels into layer control
+        {
+            const base = document.querySelector('.leaflet-control-layers-base');
+            const overlay = document.querySelector('.leaflet-control-layers-overlays');
+            if (base) {
+                const lbl = document.createElement('div');
+                lbl.className = 'layers-section-label';
+                lbl.textContent = 'Base Map';
+                base.prepend(lbl);
+            }
+            if (overlay) {
+                const lbl = document.createElement('div');
+                lbl.className = 'layers-section-label';
+                lbl.textContent = 'Satellite Overlays';
+                overlay.prepend(lbl);
+            }
+        }
 
         // === Time Slider Control ===
         const TimeSlider = L.Control.extend({
