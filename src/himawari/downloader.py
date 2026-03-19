@@ -68,6 +68,34 @@ def list_recent_observations(cfg: HimawariConfig, lookback_min: int = 30) -> lis
     return sorted(observations)
 
 
+def list_observations_for_date(cfg: HimawariConfig, date_str: str) -> list[str]:
+    """List all observation timestamps available on S3 for a given date.
+
+    Args:
+        cfg: Himawari configuration.
+        date_str: Date in "YYYYMMDD" format.
+
+    Returns:
+        List of "YYYYMMDD_HHMM" strings, sorted oldest-first.
+    """
+    s3 = _s3_client(cfg)
+    year, month, day = date_str[:4], date_str[4:6], date_str[6:8]
+    prefix = f"{cfg.prefix}/{year}/{month}/{day}/"
+
+    observations: list[str] = []
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=cfg.bucket, Prefix=prefix, Delimiter="/"):
+            for cp in page.get("CommonPrefixes", []):
+                obs_folder = cp["Prefix"].rstrip("/").split("/")[-1]
+                if len(obs_folder) == 4 and obs_folder.isdigit():
+                    observations.append(f"{date_str}_{obs_folder}")
+    except Exception:
+        logger.exception("Failed to list S3 observations for date: %s", date_str)
+
+    return sorted(observations)
+
+
 def list_segment_keys(cfg: HimawariConfig, obs_timestamp: str) -> dict[str, list[str]]:
     """Find S3 keys for NSW segments of required bands for a given observation.
 
