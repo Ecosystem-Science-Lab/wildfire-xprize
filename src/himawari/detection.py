@@ -19,10 +19,13 @@ class FireDetectionResult:
     """Result of fire detection algorithm."""
 
     fire_mask: np.ndarray  # 0=no fire, 1=LOW, 2=NOMINAL, 3=HIGH
+    sza: np.ndarray  # Solar zenith angle (degrees) — reused by converter
     n_candidates: int = 0
     n_fires: int = 0
     n_absolute: int = 0
     n_contextual: int = 0
+    n_glint_rejected: int = 0
+    n_water_rejected: int = 0
     timing_ms: dict = field(default_factory=dict)
 
 
@@ -39,6 +42,82 @@ def compute_solar_zenith(
     return sza.astype(np.float32)
 
 
+def _compute_glint_angle(
+    lats: np.ndarray, lons: np.ndarray, obs_time: datetime
+) -> np.ndarray:
+    """Compute sun glint angle for a geostationary satellite.
+
+    Glint angle = angle between specular reflection direction and satellite view.
+    For geostationary satellite at 140.7°E (Himawari-9), sub-satellite point is
+    on the equator. Approximation uses solar geometry and satellite viewing geometry.
+
+    Returns glint angle in degrees (float32). Lower = more glint risk.
+    """
+    from pyorbital.astronomy import sun_zenith_angle, get_alt_az
+
+    # Solar position
+    sun_alt, sun_az = get_alt_az(obs_time, lons, lats)
+    sun_zen = 90.0 - sun_alt  # zenith = 90 - altitude
+
+    # Satellite viewing geometry for Himawari-9 at 140.7°E
+    sat_lon = 140.7
+    sat_alt_km = 35786.0  # GEO altitude
+
+    lat_r = np.radians(lats)
+    dlon_r = np.radians(lons - sat_lon)
+
+    # Satellite zenith angle from ground point
+    cos_gamma = np.cos(lat_r) * np.cos(dlon_r)
+    re = 6371.0
+    sat_zen = np.degrees(np.arctan2(
+        np.sqrt(1.0 - cos_gamma ** 2),
+        cos_gamma - re / (re + sat_alt_km)
+    ))
+
+    # Satellite azimuth (from north)
+    sat_az = np.degrees(np.arctan2(np.sin(dlon_r), -np.sin(lat_r) * np.cos(dlon_r)))
+
+    # Glint angle: angular distance between specular reflection and satellite
+    # Specular reflection has same zenith as sun, azimuth rotated 180°
+    sun_zen_r = np.radians(sun_zen)
+    sat_zen_r = np.radians(sat_zen)
+    sun_az_r = np.radians(sun_az)
+    sat_az_r = np.radians(sat_az)
+
+    # Specular direction: zenith = sun_zen, azimuth = sun_az + 180
+    cos_glint = (
+        np.cos(sun_zen_r) * np.cos(sat_zen_r)
+        + np.sin(sun_zen_r) * np.sin(sat_zen_r) * np.cos(sun_az_r - sat_az_r + np.pi)
+    )
+    cos_glint = np.clip(cos_glint, -1.0, 1.0)
+    glint_angle = np.degrees(np.arccos(cos_glint))
+
+    return glint_angle.astype(np.float32)
+
+
+def _compute_water_mask(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Simple water mask based on distance to coast.
+
+    Uses a coarse check: reject pixels that are clearly ocean based on
+    NSW's coastline. Pixels east of the coast + small buffer are water.
+    This is a rough approximation; a proper land/sea mask would be better.
+
+    Returns boolean array — True = water pixel.
+    """
+    # NSW coastline approximation: east boundary varies by latitude
+    # Simple model: coast is roughly at these longitudes
+    # -28 to -33: ~153.5°E
+    # -33 to -37: ~151°E (Sydney to border region)
+    # -37 to -38: ~150°E (far south)
+    # Add 0.05° buffer (~5km) for coastal pixels
+    coast_lon = np.where(
+        lats > -33.0,
+        153.6,
+        np.where(lats > -37.0, 151.5, 150.3),
+    )
+    return lons > coast_lon
+
+
 def detect_fires(
     bt7: np.ndarray,
     bt14: np.ndarray,
@@ -51,29 +130,23 @@ def detect_fires(
     """Run contextual fire detection algorithm.
 
     Args:
-        bt7: Band 7 (3.9µm) brightness temperature in K
-        bt14: Band 14 (11.2µm) brightness temperature in K
+        bt7: Band 7 (3.9um) brightness temperature in K
+        bt14: Band 14 (11.2um) brightness temperature in K
         lats, lons: Coordinate arrays
         obs_time: Observation time (UTC)
         valid_mask: Boolean mask — True = valid pixel (in NSW, not cloud, not NaN)
         cfg: Detection configuration
 
     Returns:
-        FireDetectionResult with fire_mask and stats.
+        FireDetectionResult with fire_mask, sza, and stats.
     """
     import time
 
     t0 = time.monotonic()
-    result = FireDetectionResult(fire_mask=np.zeros(bt7.shape, dtype=np.int8))
     timings = {}
 
     # Compute BTD
     btd = bt7 - bt14
-
-    # Replace invalid pixels with NaN for background stats
-    bt7_valid = np.where(valid_mask, bt7, np.nan)
-    bt14_valid = np.where(valid_mask, bt14, np.nan)
-    btd_valid = np.where(valid_mask, btd, np.nan)
 
     # --- Step 0: Solar zenith angle ---
     t1 = time.monotonic()
@@ -81,11 +154,33 @@ def detect_fires(
     is_day = sza < cfg.sza_day_night_deg
     timings["sza"] = round((time.monotonic() - t1) * 1000, 1)
 
+    result = FireDetectionResult(
+        fire_mask=np.zeros(bt7.shape, dtype=np.int8),
+        sza=sza,
+    )
+
+    # --- Step 0b: Water mask ---
+    t1 = time.monotonic()
+    water_mask = _compute_water_mask(lats, lons)
+    valid_land = valid_mask & (~water_mask)
+    result.n_water_rejected = int(np.sum(valid_mask & water_mask))
+    timings["water_mask"] = round((time.monotonic() - t1) * 1000, 1)
+
+    # --- Step 0c: Sun glint rejection (daytime only) ---
+    t1 = time.monotonic()
+    glint_mask = np.zeros(bt7.shape, dtype=bool)
+    if np.any(valid_land & is_day):
+        glint_angle = _compute_glint_angle(lats, lons, obs_time)
+        glint_mask = is_day & (glint_angle < cfg.sun_glint_angle_deg)
+        result.n_glint_rejected = int(np.sum(valid_land & glint_mask))
+    valid_land = valid_land & (~glint_mask)
+    timings["glint"] = round((time.monotonic() - t1) * 1000, 1)
+
     # --- Step 1: Absolute thresholds → HIGH confidence ---
     t1 = time.monotonic()
-    saturated = valid_mask & (bt7 >= cfg.saturated_bt7_k)
-    extreme_day = valid_mask & is_day & (bt7 >= cfg.extreme_day_bt7_k)
-    extreme_night = valid_mask & (~is_day) & (bt7 >= cfg.extreme_night_bt7_k)
+    saturated = valid_land & (bt7 >= cfg.saturated_bt7_k)
+    extreme_day = valid_land & is_day & (bt7 >= cfg.extreme_day_bt7_k)
+    extreme_night = valid_land & (~is_day) & (bt7 >= cfg.extreme_night_bt7_k)
     absolute_fire = saturated | extreme_day | extreme_night
     result.fire_mask[absolute_fire] = 3  # HIGH
     result.n_absolute = int(np.sum(absolute_fire))
@@ -94,12 +189,12 @@ def detect_fires(
     # --- Step 2: Candidate selection ---
     t1 = time.monotonic()
     day_candidate = (
-        valid_mask & is_day & (~absolute_fire)
+        valid_land & is_day & (~absolute_fire)
         & (bt7 >= cfg.candidate_day_bt7_k)
         & (btd >= cfg.candidate_day_btd_k)
     )
     night_candidate = (
-        valid_mask & (~is_day) & (~absolute_fire)
+        valid_land & (~is_day) & (~absolute_fire)
         & (bt7 >= cfg.candidate_night_bt7_k)
         & (btd >= cfg.candidate_night_btd_k)
     )
@@ -111,8 +206,9 @@ def detect_fires(
         timings["total"] = round((time.monotonic() - t0) * 1000, 1)
         result.timing_ms = timings
         logger.info(
-            "Detection complete: %d absolute, 0 candidates, 0 contextual",
-            result.n_absolute,
+            "Detection complete: %d absolute, 0 candidates, 0 contextual "
+            "(%d water, %d glint rejected)",
+            result.n_absolute, result.n_water_rejected, result.n_glint_rejected,
         )
         result.n_fires = result.n_absolute
         return result
@@ -120,8 +216,18 @@ def detect_fires(
     # --- Step 3: Background characterization ---
     t1 = time.monotonic()
 
-    # Background pixels: valid, not candidate, not already absolute fire
-    bg_mask = valid_mask & (~candidates) & (~absolute_fire)
+    # Background fire exclusion: hot pixels that aren't fire candidates
+    # but would contaminate background statistics
+    bg_fire_day = (
+        is_day & (bt7 >= cfg.bg_fire_day_bt7_k) & (btd >= cfg.bg_fire_day_btd_k)
+    )
+    bg_fire_night = (
+        (~is_day) & (bt7 >= cfg.bg_fire_night_bt7_k) & (btd >= cfg.bg_fire_night_btd_k)
+    )
+    bg_fire_exclude = bg_fire_day | bg_fire_night
+
+    # Background pixels: valid land, not candidate, not absolute fire, not bg fire
+    bg_mask = valid_land & (~candidates) & (~absolute_fire) & (~bg_fire_exclude)
 
     # Try progressively larger windows
     bg_bt7_mean = np.full(bt7.shape, np.nan, dtype=np.float32)
@@ -139,7 +245,6 @@ def detect_fires(
         bg_float = bg_mask.astype(np.float32)
         count = uniform_filter(bg_float, size=win_size, mode="constant", cval=0.0)
         total_pixels = win_size * win_size
-        frac = count  # count is already fraction-like from uniform_filter normalization
 
         # uniform_filter computes mean of the window, so count = fraction of valid bg pixels
         # To get actual count: count * win_size^2
@@ -158,6 +263,7 @@ def detect_fires(
         var_bt7 = bt7_sq_sum / safe_count - mean_bt7 ** 2
         var_bt7 = np.maximum(var_bt7, 0.0)  # Numerical stability
         std_bt7 = np.sqrt(var_bt7)
+        std_bt7 = np.maximum(std_bt7, cfg.min_background_std_k)  # Floor
 
         # BTD background stats
         btd_bg = np.where(bg_mask, btd, 0.0).astype(np.float32)
@@ -169,6 +275,7 @@ def detect_fires(
         var_btd = btd_sq_sum / safe_count - mean_btd ** 2
         var_btd = np.maximum(var_btd, 0.0)
         std_btd = np.sqrt(var_btd)
+        std_btd = np.maximum(std_btd, cfg.min_background_std_k)  # Floor
 
         # Update where newly sufficient
         new_sufficient = sufficient & (~bg_sufficient)
@@ -189,12 +296,19 @@ def detect_fires(
     contextual_btd_sigma = btd > (bg_btd_mean + sigma * bg_btd_std)
     contextual_btd_floor = btd > (bg_btd_mean + cfg.btd_floor_k)
 
+    # Absolute BT7 floor per spec (prevents warm non-fire pixels at night)
+    bt7_floor = np.where(
+        is_day, cfg.contextual_floor_day_bt7_k, cfg.contextual_floor_night_bt7_k
+    )
+    contextual_bt7_floor = bt7 >= bt7_floor
+
     contextual_fire = (
         candidates
         & bg_sufficient
         & contextual_bt7
         & contextual_btd_sigma
         & contextual_btd_floor
+        & contextual_bt7_floor
     )
     result.n_contextual = int(np.sum(contextual_fire))
     timings["contextual"] = round((time.monotonic() - t1) * 1000, 1)
@@ -218,11 +332,14 @@ def detect_fires(
     result.timing_ms = timings
 
     logger.info(
-        "Detection complete: %d absolute, %d candidates, %d contextual, %d total fires (%.0fms)",
+        "Detection complete: %d absolute, %d candidates, %d contextual, %d total fires "
+        "(%d water, %d glint rejected) (%.0fms)",
         result.n_absolute,
         result.n_candidates,
         result.n_contextual,
         result.n_fires,
+        result.n_water_rejected,
+        result.n_glint_rejected,
         timings["total"],
     )
 

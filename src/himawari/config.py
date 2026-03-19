@@ -38,6 +38,17 @@ class HimawariConfig(BaseModel):
     btd_floor_k: float = 6.0
     min_background_fraction: float = 0.25
     background_window_sizes: list[int] = [11, 15, 21]
+    # Absolute BT7 floor for contextual fires (per spec Step 5)
+    contextual_floor_day_bt7_k: float = 310.0
+    contextual_floor_night_bt7_k: float = 295.0
+    # Minimum background std to prevent false positives in homogeneous terrain
+    min_background_std_k: float = 2.0
+
+    # --- Background fire exclusion (excluded from bg stats, not flagged as fire) ---
+    bg_fire_day_bt7_k: float = 335.0
+    bg_fire_day_btd_k: float = 30.0
+    bg_fire_night_bt7_k: float = 300.0
+    bg_fire_night_btd_k: float = 10.0
 
     # --- Cloud masking ---
     cloud_bt14_threshold_k: float = 265.0

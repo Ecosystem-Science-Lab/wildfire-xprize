@@ -13,7 +13,7 @@ from ..dedup import ingest_batch
 from .config import HimawariConfig
 from .converter import fire_pixels_to_detections
 from .decoder import decode_hsd_to_bt
-from .detection import FireDetectionResult, compute_solar_zenith, detect_fires
+from .detection import FireDetectionResult, detect_fires
 from .downloader import download_segments, list_segment_keys
 from .masks import compute_cloud_adjacency, compute_cloud_mask, compute_nsw_mask
 
@@ -100,11 +100,10 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
     )
     timings["detection"] = round((time.monotonic() - t) * 1000, 1)
 
-    # Step 6: Convert fire pixels to Detection objects
+    # Step 6: Convert fire pixels to Detection objects (reuse SZA from detection)
     t = time.monotonic()
-    sza = compute_solar_zenith(lats, lons, obs_time)
     detections = fire_pixels_to_detections(
-        result.fire_mask, bt7, bt14, lats, lons, obs_time, sza, cfg
+        result.fire_mask, bt7, bt14, lats, lons, obs_time, result.sza, cfg
     )
     timings["convert"] = round((time.monotonic() - t) * 1000, 1)
 

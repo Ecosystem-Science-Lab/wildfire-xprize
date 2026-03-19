@@ -39,19 +39,29 @@ async def poll_himawari_loop(cfg: HimawariConfig) -> None:
             if new_obs:
                 logger.info("Found %d new Himawari observations: %s", len(new_obs), new_obs)
 
-            for obs_ts in new_obs:
+            # Process newest observation first for lowest latency
+            for obs_ts in reversed(new_obs):
                 try:
                     stats = await process_observation(obs_ts, cfg)
-                    mark_processed(obs_ts)
-                    observations_processed = get_processed_count()
 
                     if stats.get("status") == "ok":
+                        mark_processed(obs_ts)
+                        observations_processed = get_processed_count()
                         logger.info(
                             "Himawari %s: %d fires detected (%d new detections)",
                             obs_ts,
                             stats.get("n_fires", 0),
                             stats.get("detections_new", 0),
                         )
+                    elif stats.get("status") == "incomplete":
+                        logger.warning(
+                            "Himawari %s: incomplete data (%d files) — will retry",
+                            obs_ts, stats.get("files_found", 0),
+                        )
+                    else:
+                        # Other non-ok statuses (e.g. no_nsw_pixels) — mark done
+                        mark_processed(obs_ts)
+                        observations_processed = get_processed_count()
                 except Exception:
                     logger.exception("Failed to process Himawari observation %s", obs_ts)
 
