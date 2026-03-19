@@ -24,16 +24,19 @@ class CUSUMConfig(BaseModel):
     # Observation noise variance (K^2) — daytime vs nighttime
     R_day: float = 0.25
     R_night: float = 0.09
-    # If z-score exceeds this, skip Kalman update (fire contamination gate)
+    # Legacy hard gate — replaced by soft Bayesian weighting (1 - P(fire)).
+    # Retained for backward compatibility but not used in current update logic.
     fire_gate_sigma: float = 2.0
     # Minimum clear-sky observations before CUSUM is activated for a pixel
     min_init_observations: int = 48  # ~8 hours of clear sky at 10-min cadence
 
     # --- CUSUM decision rule ---
     k_ref: float = 0.5          # Reference value (sigma units) — slow CUSUM for small fires
-    h_threshold: float = 12.0   # Decision threshold (sigma units). k=0.5,h=12 → ARL₀ ≈ 325K frames
+    h_threshold: float = 12.0   # Decision threshold (sigma units) — legacy, not used for triggering
     k_ref_fast: float = 1.5     # Reference value for fast CUSUM — large fires in minutes
-    h_threshold_fast: float = 5.0  # Decision threshold for fast CUSUM
+    h_threshold_fast: float = 5.0  # Decision threshold for fast CUSUM — legacy, not used for triggering
+    # Note: actual trigger is P(fire) >= detection_probability_threshold,
+    # which maps to S_max ≈ 5.76 with current cusum_to_logodds_scale and fire_prior.
     tau_decay_hours: float = 3.0  # Exponential decay time constant during cloud gaps
 
     # --- BT14 EMA ---
@@ -45,15 +48,17 @@ class CUSUMConfig(BaseModel):
 
     # --- Alert criteria ---
     anomaly_z_threshold: float = 1.0   # z-score above which a frame counts as anomalous
-    min_consecutive_anomalies: int = 6  # ~1 hour of consistent anomalies at 10-min cadence
+    min_consecutive_anomalies: int = 6  # Tracked for diagnostics only; not used in detection
+                                        # decision (CUSUM already handles temporal accumulation)
     require_adjacent: bool = True       # Require >= 1 neighboring pixel also flagged
 
-    # --- Bayesian probability parameters ---
+    # --- Bayesian fire confidence parameters ---
     fire_prior: float = 1e-5           # Prior P(fire) per pixel per frame
     cusum_to_logodds_scale: float = 2.0  # Scale factor: log_odds += scale * S_max
     min_kalman_weight: float = 0.01    # Minimum Kalman gain scaling (prevents total freeze)
     detection_probability_threshold: float = 0.5  # P(fire) threshold for candidate detection
     display_probability_threshold: float = 0.05   # P(fire) threshold for portal display
+    bt14_ema_fire_threshold: float = 0.5  # Skip BT14 EMA update when fire_confidence >= this
 
     # --- Training data store ---
     training_store_enabled: bool = False  # Enable per-frame training data recording

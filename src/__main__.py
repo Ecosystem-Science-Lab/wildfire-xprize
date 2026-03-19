@@ -296,7 +296,7 @@ async def api_cusum_heatmap():
     stats = latest["cusum_stats"]
     threshold = latest["display_probability_threshold"]
 
-    fp = cusum_result["fire_probability"]
+    fp = cusum_result["fire_confidence"]
     s_slow = cusum_result["cusum_values_slow"]
     s_fast = cusum_result["cusum_values_fast"]
 

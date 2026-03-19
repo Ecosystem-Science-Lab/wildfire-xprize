@@ -12,21 +12,37 @@ residual flat and avoiding false alarms.  Fires raise BTD without proportional
 BT14 increases, so the residual stays positive and CUSUM accumulates.
 
 Dual-rate CUSUM (S_slow, S_fast) on normalized residuals flags persistent
-positive BTD anomalies.  S_slow (k=0.5, h=12) catches small fires over hours;
-S_fast (k=1.5, h=5) catches large fires in minutes.  A BT14 rejection
-criterion suppresses candidates where BT14 is itself anomalously warm
-(weather-driven), unless the anomaly is extreme (possible large fire heating
-the BT14 channel).
+positive BTD anomalies.  S_slow (k=0.5) catches small fires over hours;
+S_fast (k=1.5) catches large fires in minutes.  A BT14 rejection criterion
+suppresses candidates where BT14 is itself anomalously warm (weather-driven),
+unless the anomaly is extreme (possible large fire heating the BT14 channel).
 
-A Bayesian probability interpretation layer converts the CUSUM S statistic
-(which is a log-likelihood ratio) into a posterior fire probability:
+A confidence layer converts the CUSUM S statistic (log-likelihood ratio) into
+a fire confidence score:
 
-  P(fire | obs) = 1 / (1 + (1/prior_odds) * exp(-alpha * S_max))
+  fire_confidence = 1 / (1 + (1/prior_odds) * exp(-alpha * S_max))
 
-This replaces hard detection thresholds with smooth probability estimates.
-The Kalman gain is also softly weighted by (1 - P(fire)), so that pixels
-with high fire probability have their background model frozen (protecting
+Note: this is not a true Bayesian posterior (the prior is a tuning knob, not
+a calibrated probability).  It is better understood as a sigmoid mapping from
+CUSUM accumulation to a [0, 1] confidence score.
+
+Detection trigger: fire_confidence >= detection_probability_threshold (default
+0.5), which maps to S_max ~ 5.76 with current settings.
+
+The Kalman gain is softly weighted by (1 - fire_confidence), so that pixels
+with high fire confidence have their background model frozen (protecting
 against fire contamination), while normal pixels get full Kalman updates.
+Covariance is updated via the Joseph form for numerical stability with the
+softened gain.
+
+Update ordering within each frame (critical for correctness):
+  1. Kalman prediction
+  2. Compute innovation/residual from prediction
+  3. CUSUM update from residual (S_slow, S_fast)
+  4. Compute fire_confidence from UPDATED S values
+  5. Compute BT14 anomaly from OLD (pre-update) EMA
+  6. Kalman update weighted by (1 - fire_confidence)
+  7. Update BT14 EMA only for pixels with low fire_confidence
 
 All state arrays are flat (n_pixels,) over the NSW-cropped grid.  Operations
 are fully vectorized with numpy — no per-pixel Python loops.
@@ -144,6 +160,7 @@ class CUSUMTemporalDetector:
         self.S_fast = np.zeros(n_pixels, dtype=np.float32)  # Fast CUSUM (large fires)
         self.n_obs = np.zeros(n_pixels, dtype=np.int32)  # clear-sky obs count
         self.last_clear_time = np.full(n_pixels, np.nan, dtype=np.float64)  # UNIX timestamp
+        self.last_update_time = np.full(n_pixels, np.nan, dtype=np.float64)  # UNIX timestamp (all frames)
         self.consecutive_anomalies = np.zeros(n_pixels, dtype=np.int16)
 
         # Frame counter (for periodic state saves)
@@ -159,6 +176,15 @@ class CUSUMTemporalDetector:
     ) -> dict:
         """Process one observation frame.
 
+        Ordering (critical for correctness):
+          1. Kalman prediction
+          2. Compute BT14 anomaly from OLD (pre-update) EMA
+          3. Compute innovation/residual
+          4. CUSUM update (S_slow, S_fast) from residual
+          5. Compute fire_confidence from UPDATED S values
+          6. Kalman update weighted by (1 - fire_confidence), Joseph form
+          7. Update BT14 EMA only for low-confidence pixels
+
         Args:
             btd_flat: BT7 - BT14 values, shape (n_pixels,).  NaN for invalid.
             bt14_flat: BT14 values, shape (n_pixels,).  Used only for metadata.
@@ -169,8 +195,8 @@ class CUSUMTemporalDetector:
         Returns:
             Dictionary with:
                 fire_candidates    — bool array (n_pixels,)
-                fire_probability   — float32 array (n_pixels,), Bayesian P(fire);
-                                     NaN for uninitialized pixels
+                fire_confidence    — float32 array (n_pixels,), sigmoid confidence
+                                     score; NaN for uninitialized pixels
                 residuals          — float array (n_pixels,), normalized z-scores
                 cusum_values_slow  — float array (n_pixels,), S_slow statistic
                 cusum_values_fast  — float array (n_pixels,), S_fast statistic
@@ -202,13 +228,187 @@ class CUSUMTemporalDetector:
         btd_safe = np.where(np.isfinite(btd), btd, 0.0)
         bt14_safe = np.where(np.isfinite(bt14), bt14, 0.0)
 
-        # --- Update BT14 EMA (clear-sky pixels only) ---
+        # ================================================================
+        # Step 1: Compute BT14 anomaly from OLD (pre-update) EMA
+        # (Bug 4 fix: detect-before-learn — use stale EMA so that a
+        # fire warming BT14 doesn't shrink the anomaly on the detection
+        # frame itself.)
+        # ================================================================
+
         # Initialize EMA to first observed value where not yet set
         ema_uninit = clear & np.isnan(self.bt14_ema)
         if np.any(ema_uninit):
             self.bt14_ema[ema_uninit] = bt14_safe[ema_uninit]
 
-        # Compute EMA alpha from time since last clear observation
+        # BT14 anomaly computed from OLD EMA (before any update this frame)
+        bt14_anom = np.where(
+            np.isfinite(self.bt14_ema), bt14_safe - self.bt14_ema, 0.0
+        )
+
+        # ================================================================
+        # Step 2: Kalman prediction
+        # ================================================================
+
+        # Compute local solar time
+        utc_hour = (obs_time_unix % 86400) / 3600.0
+        lst_hours = (utc_hour + self.pixel_lons / 15.0) % 24.0
+
+        # Build observation matrix H (n, 6) using OLD bt14_anom
+        H = _build_H(lst_hours.astype(np.float64), bt14_anom)
+
+        # F = I, so x_pred = x, P_pred = P + Q
+        P_pred = self.P + self.Q[np.newaxis, :, :]  # (n, 6, 6)
+
+        # ================================================================
+        # Step 3: Compute innovation/residual from prediction
+        # ================================================================
+
+        # y_pred = H @ x  (per-pixel dot product)
+        y_pred = np.einsum("ij,ij->i", H, self.x)  # (n,)
+
+        # Innovation (residual)
+        innovation = btd_safe - y_pred  # (n,)
+
+        # Innovation variance: S_innov = H @ P_pred @ H^T + R  (scalar per pixel)
+        HP = np.einsum("ij,ijk->ik", H, P_pred)  # (n, 6)
+        S_innov = np.einsum("ij,ij->i", HP, H)  # (n,)
+
+        # Observation noise R depends on day/night
+        R_vals = np.where(day, cfg.R_day, cfg.R_night)
+        S_innov += R_vals
+        # Safety: floor at small positive value
+        S_innov = np.maximum(S_innov, 1e-6)
+
+        sigma_pred = np.sqrt(S_innov)  # (n,)
+
+        # Normalized residual
+        z = innovation / sigma_pred  # (n,)
+
+        # ================================================================
+        # Step 4: CUSUM update BEFORE computing fire_confidence
+        # (Bug 1 fix: update S_slow/S_fast with current-frame residual so
+        # that fire_confidence reflects S_t, not S_{t-1}.)
+        # ================================================================
+
+        initialized = self.n_obs >= cfg.min_init_observations  # (n,)
+        cusum_eligible = clear & initialized
+
+        # Store residuals (z-scores) for output; NaN where not eligible
+        residuals_out = np.full(n, np.nan, dtype=np.float32)
+
+        if np.any(cusum_eligible):
+            idx_c = np.where(cusum_eligible)[0]
+            z_c = z[idx_c].astype(np.float32)
+            residuals_out[idx_c] = z_c
+
+            # Dual CUSUM update
+            self.S_slow[idx_c] = np.maximum(0.0, self.S_slow[idx_c] + z_c - cfg.k_ref)
+            self.S_fast[idx_c] = np.maximum(0.0, self.S_fast[idx_c] + z_c - cfg.k_ref_fast)
+
+            # Track consecutive anomalies for diagnostics (z > anomaly_z_threshold)
+            anomalous = z_c > cfg.anomaly_z_threshold
+            self.consecutive_anomalies[idx_c] = np.where(
+                anomalous,
+                self.consecutive_anomalies[idx_c] + 1,
+                0,
+            ).astype(np.int16)
+
+        # --- CUSUM decay for cloudy pixels ---
+        # (Bug 2 fix: use incremental dt from last_update_time, not total
+        # time since last clear frame.  last_update_time advances every
+        # frame so each cloudy step decays by ~exp(-600s/tau), not the
+        # full cumulative gap.)
+        cloudy = ~clear
+        if np.any(cloudy):
+            has_history = cloudy & np.isfinite(self.last_update_time)
+            if np.any(has_history):
+                dt_increment = obs_time_unix - self.last_update_time[has_history]
+                dt_increment = np.maximum(dt_increment, 0.0)
+                tau_decay_s = cfg.tau_decay_hours * 3600.0
+                decay = np.exp(-dt_increment / tau_decay_s).astype(np.float32)
+                self.S_slow[has_history] *= decay
+                self.S_fast[has_history] *= decay
+                # Also decay consecutive anomaly count
+                self.consecutive_anomalies[has_history] = 0
+
+        # ================================================================
+        # Step 5: Compute fire_confidence from UPDATED S values
+        # (Bug 1 fix continued: now reflects current-frame CUSUM.)
+        # ================================================================
+
+        S_max = np.maximum(self.S_slow, self.S_fast).astype(np.float64)
+        log_prior_odds = np.log(cfg.fire_prior / (1.0 - cfg.fire_prior))
+        log_posterior_odds = log_prior_odds + cfg.cusum_to_logodds_scale * S_max
+        # Clip to prevent overflow in exp() for very negative values
+        log_posterior_odds = np.clip(log_posterior_odds, -50.0, 50.0)
+        fire_confidence = (1.0 / (1.0 + np.exp(-log_posterior_odds))).astype(np.float32)
+        # NaN for uninitialized pixels (no meaningful confidence yet)
+        uninit_mask = self.n_obs < cfg.min_init_observations
+        fire_confidence[uninit_mask] = np.float32(np.nan)
+
+        # ================================================================
+        # Step 6: Kalman update weighted by (1 - fire_confidence)
+        # (Bug 3 fix: Joseph form for covariance update with softened gain.)
+        # ================================================================
+
+        # Soft Kalman weighting: high fire_confidence suppresses model updates
+        kalman_weight = np.where(
+            np.isfinite(fire_confidence),
+            1.0 - fire_confidence,
+            1.0,  # uninitialized pixels get full update
+        ).astype(np.float64)
+        kalman_weight = np.maximum(kalman_weight, cfg.min_kalman_weight)
+
+        update_mask = clear.copy()
+
+        if np.any(update_mask):
+            idx = np.where(update_mask)[0]
+
+            H_u = H[idx]           # (m, 6)
+            HP_u = HP[idx]         # (m, 6)
+            S_u = S_innov[idx]     # (m,)
+            innov_u = innovation[idx]  # (m,)
+            R_u = R_vals[idx]      # (m,)
+
+            # Raw Kalman gain: K_raw = P_pred @ H^T / S_innov
+            K_raw = HP_u / S_u[:, np.newaxis]  # (m, 6)
+
+            # Softened gain: L = (1 - fire_confidence) * K_raw
+            L = K_raw * kalman_weight[idx, np.newaxis]  # (m, 6)
+
+            # State update: x = x + L * innovation
+            self.x[idx] += L * innov_u[:, np.newaxis]
+
+            # Covariance update: Joseph form for numerical stability
+            # P = (I - L@H) @ P_pred @ (I - L@H)^T + L * R * L^T
+            LH = L[:, :, np.newaxis] * H_u[:, np.newaxis, :]  # (m, 6, 6)
+            I_LH = np.eye(_N_PARAMS, dtype=np.float64)[np.newaxis, :, :] - LH  # (m, 6, 6)
+            # (I-LH) @ P_pred @ (I-LH)^T
+            P_new = np.einsum("mij,mjk,mlk->mil", I_LH, P_pred[idx], I_LH)  # (m, 6, 6)
+            # + L * R * L^T  (R is scalar per pixel, L is vector)
+            LLT = L[:, :, np.newaxis] * L[:, np.newaxis, :]  # (m, 6, 6)
+            P_new += R_u[:, np.newaxis, np.newaxis] * LLT
+            # Symmetrize to prevent numerical drift
+            P_new = 0.5 * (P_new + np.swapaxes(P_new, -2, -1))
+            self.P[idx] = P_new
+
+            # Increment observation count and timestamps
+            self.n_obs[idx] += 1
+            self.last_clear_time[idx] = obs_time_unix
+
+        # For prediction-only pixels (cloudy), P grows via Q.
+        not_updated = ~update_mask
+        self.P[not_updated] = P_pred[not_updated]
+
+        # Advance last_update_time for ALL pixels (Bug 2 fix)
+        self.last_update_time[:] = obs_time_unix
+
+        # ================================================================
+        # Step 7: Update BT14 EMA only for low-confidence pixels
+        # (Bug 4 fix: fire pixels don't contaminate the background EMA.)
+        # ================================================================
+
+        # EMA alpha from time since last clear observation
         dt = obs_time_unix - np.where(
             np.isfinite(self.last_clear_time), self.last_clear_time, obs_time_unix
         )
@@ -216,7 +416,13 @@ class CUSUMTemporalDetector:
         tau_s = cfg.bt14_ema_tau_hours * 3600.0
         alpha_ema = 1.0 - np.exp(-dt / tau_s)
 
-        ema_update_mask = clear & np.isfinite(self.bt14_ema)
+        # Only update BT14 EMA for clear pixels with low fire confidence
+        low_fire = np.where(
+            np.isfinite(fire_confidence),
+            fire_confidence < cfg.bt14_ema_fire_threshold,
+            True,  # uninitialized pixels always update
+        )
+        ema_update_mask = clear & np.isfinite(self.bt14_ema) & low_fire
         if np.any(ema_update_mask):
             idx_ema = np.where(ema_update_mask)[0]
             self.bt14_ema[idx_ema] = (
@@ -224,7 +430,8 @@ class CUSUMTemporalDetector:
                 + (1.0 - alpha_ema[idx_ema]) * self.bt14_ema[idx_ema]
             )
 
-        # Update BT14 running variance via Welford's online algorithm (clear-sky only)
+        # Update BT14 running variance via Welford's online algorithm
+        # (also gated on low fire confidence)
         if np.any(ema_update_mask):
             idx_w = np.where(ema_update_mask)[0]
             self._bt14_var_count[idx_w] += 1
@@ -241,147 +448,15 @@ class CUSUMTemporalDetector:
                     1.0,
                 )
 
-        # BT14 anomaly for Kalman observation matrix
-        bt14_anom = np.where(
-            np.isfinite(self.bt14_ema), bt14_safe - self.bt14_ema, 0.0
+        # ================================================================
+        # Fire candidate identification
+        # ================================================================
+
+        # A pixel is a candidate when fire_confidence >= threshold
+        conf_triggered = np.isfinite(fire_confidence) & (
+            fire_confidence >= cfg.detection_probability_threshold
         )
-
-        # --- Compute local solar time ---
-        utc_hour = (obs_time_unix % 86400) / 3600.0
-        lst_hours = (utc_hour + self.pixel_lons / 15.0) % 24.0
-
-        # --- Build observation matrix H (n, 6) ---
-        H = _build_H(lst_hours.astype(np.float64), bt14_anom)
-
-        # --- Kalman prediction step ---
-        # F = I, so x_pred = x, P_pred = P + Q
-        P_pred = self.P + self.Q[np.newaxis, :, :]  # (n, 6, 6)
-
-        # --- Predicted BTD and innovation ---
-        # y_pred = H @ x  (per-pixel dot product)
-        y_pred = np.einsum("ij,ij->i", H, self.x)  # (n,)
-
-        # Innovation (residual)
-        innovation = btd_safe - y_pred  # (n,)
-
-        # Innovation variance: S_innov = H @ P_pred @ H^T + R  (scalar per pixel)
-        # Compute H @ P_pred first: (n, 6)
-        HP = np.einsum("ij,ijk->ik", H, P_pred)  # (n, 6)
-        # Then H @ P_pred @ H^T: scalar per pixel
-        S_innov = np.einsum("ij,ij->i", HP, H)  # (n,)
-
-        # Observation noise R depends on day/night
-        R = np.where(day, cfg.R_day, cfg.R_night)
-        S_innov += R
-        # Safety: floor at small positive value
-        S_innov = np.maximum(S_innov, 1e-6)
-
-        sigma_pred = np.sqrt(S_innov)  # (n,)
-
-        # Normalized residual
-        z = innovation / sigma_pred  # (n,)
-
-        # --- Bayesian fire probability from CUSUM statistics ---
-        # S is a log-likelihood ratio; convert to posterior P(fire).
-        S_max = np.maximum(self.S_slow, self.S_fast).astype(np.float64)
-        log_prior_odds = np.log(cfg.fire_prior / (1.0 - cfg.fire_prior))
-        log_posterior_odds = log_prior_odds + cfg.cusum_to_logodds_scale * S_max
-        # Clip to prevent overflow in exp() for very negative values
-        log_posterior_odds = np.clip(log_posterior_odds, -50.0, 50.0)
-        fire_probability = (1.0 / (1.0 + np.exp(-log_posterior_odds))).astype(np.float32)
-        # NaN for uninitialized pixels (no meaningful probability yet)
-        uninit_mask = self.n_obs < cfg.min_init_observations
-        fire_probability[uninit_mask] = np.float32(np.nan)
-
-        # --- Soft Bayesian Kalman weighting ---
-        # Instead of hard-gating (skip update if z > fire_gate_sigma),
-        # scale the Kalman gain by (1 - P(fire)).  High fire probability
-        # suppresses model updates, protecting the background model.
-        kalman_weight = np.where(
-            np.isfinite(fire_probability),
-            1.0 - fire_probability,
-            1.0,  # uninitialized pixels get full update
-        ).astype(np.float64)
-        kalman_weight = np.maximum(kalman_weight, cfg.min_kalman_weight)
-
-        # Update all clear pixels (no hard gate — soft weighting replaces it)
-        update_mask = clear.copy()
-
-        # --- Kalman update (vectorized, only for clear pixels) ---
-        if np.any(update_mask):
-            idx = np.where(update_mask)[0]
-
-            H_u = H[idx]           # (m, 6)
-            HP_u = HP[idx]         # (m, 6)
-            S_u = S_innov[idx]     # (m,)
-            innov_u = innovation[idx]  # (m,)
-
-            # Kalman gain K = P_pred @ H^T / S_innov, scaled by (1 - P(fire))
-            K = (HP_u / S_u[:, np.newaxis]) * kalman_weight[idx, np.newaxis]  # (m, 6)
-
-            # State update: x = x + K * innovation
-            self.x[idx] += K * innov_u[:, np.newaxis]
-
-            # Covariance update: P = (I - K @ H) @ P_pred
-            # K @ H: (m, 6, 1) @ (m, 1, 6) → (m, 6, 6)
-            KH = K[:, :, np.newaxis] * H_u[:, np.newaxis, :]  # (m, 6, 6)
-            I_KH = np.eye(_N_PARAMS, dtype=np.float64)[np.newaxis, :, :] - KH  # (m, 6, 6)
-            self.P[idx] = np.einsum("mij,mjk->mik", I_KH, P_pred[idx])
-
-            # Increment observation count
-            self.n_obs[idx] += 1
-            self.last_clear_time[idx] = obs_time_unix
-
-        # For prediction-only pixels (cloudy), P grows via Q.
-        not_updated = ~update_mask
-        self.P[not_updated] = P_pred[not_updated]
-
-        # --- CUSUM decay for cloudy pixels ---
-        cloudy = ~clear
-        if np.any(cloudy):
-            dt_since_clear = obs_time_unix - self.last_clear_time  # seconds
-            # Only decay where we have a valid last_clear_time
-            has_history = cloudy & np.isfinite(self.last_clear_time)
-            if np.any(has_history):
-                tau_decay_s = cfg.tau_decay_hours * 3600.0
-                decay = np.exp(-dt_since_clear[has_history] / tau_decay_s).astype(np.float32)
-                self.S_slow[has_history] *= decay
-                self.S_fast[has_history] *= decay
-                # Also decay consecutive anomaly count
-                self.consecutive_anomalies[has_history] = 0
-
-        # --- Dual-rate CUSUM update for clear pixels ---
-        initialized = self.n_obs >= cfg.min_init_observations  # (n,)
-        cusum_eligible = clear & initialized
-
-        # Store residuals (z-scores) for output; NaN where not eligible
-        residuals_out = np.full(n, np.nan, dtype=np.float32)
-
-        if np.any(cusum_eligible):
-            idx_c = np.where(cusum_eligible)[0]
-            z_c = z[idx_c].astype(np.float32)
-            residuals_out[idx_c] = z_c
-
-            # Dual CUSUM update
-            self.S_slow[idx_c] = np.maximum(0.0, self.S_slow[idx_c] + z_c - cfg.k_ref)
-            self.S_fast[idx_c] = np.maximum(0.0, self.S_fast[idx_c] + z_c - cfg.k_ref_fast)
-
-            # Track consecutive anomalies (z > anomaly_z_threshold)
-            anomalous = z_c > cfg.anomaly_z_threshold
-            # Reset counter where not anomalous, increment where anomalous
-            self.consecutive_anomalies[idx_c] = np.where(
-                anomalous,
-                self.consecutive_anomalies[idx_c] + 1,
-                0,
-            ).astype(np.int16)
-
-        # --- Fire candidate identification (Bayesian) ---
-        # Use posterior fire probability instead of hard CUSUM thresholds.
-        # A pixel is a candidate when P(fire) >= detection_probability_threshold.
-        prob_triggered = np.isfinite(fire_probability) & (
-            fire_probability >= cfg.detection_probability_threshold
-        )
-        candidates = cusum_eligible & prob_triggered
+        candidates = cusum_eligible & conf_triggered
 
         # --- BT14 rejection criterion ---
         # Suppress candidates where BT14 is anomalously warm (weather, not fire)
@@ -409,7 +484,6 @@ class CUSUMTemporalDetector:
 
         # --- Auto-reset detected pixels ---
         # After detection, reset both CUSUM statistics to prevent re-firing.
-        # The pixel must re-accumulate evidence for a new detection.
         if np.any(candidates):
             self.S_slow[candidates] = 0.0
             self.S_fast[candidates] = 0.0
@@ -423,11 +497,11 @@ class CUSUMTemporalDetector:
         elapsed_ms = (time.monotonic() - t0) * 1000.0
 
         if n_candidates > 0:
-            max_prob = float(np.nanmax(fire_probability))
+            max_conf = float(np.nanmax(fire_confidence))
             logger.info(
                 "CUSUM update: %d fire candidates (%d BT14-rejected), "
-                "max P(fire)=%.4f, %d/%d pixels initialized (%.1fms)",
-                n_candidates, n_bt14_rejected, max_prob,
+                "max fire_confidence=%.4f, %d/%d pixels initialized (%.1fms)",
+                n_candidates, n_bt14_rejected, max_conf,
                 n_initialized, n, elapsed_ms,
             )
         else:
@@ -438,7 +512,7 @@ class CUSUMTemporalDetector:
 
         return {
             "fire_candidates": candidates,
-            "fire_probability": fire_probability,  # (n_pixels,) float32
+            "fire_confidence": fire_confidence,  # (n_pixels,) float32
             "residuals": residuals_out,
             "cusum_values_slow": self.S_slow.copy(),
             "cusum_values_fast": self.S_fast.copy(),
@@ -447,7 +521,7 @@ class CUSUMTemporalDetector:
             "n_initialized": n_initialized,
             "timing_ms": round(elapsed_ms, 2),
             "diagnostics": {
-                "fire_probability": fire_probability,
+                "fire_confidence": fire_confidence,
                 "z_scores": residuals_out,
                 "S_slow": self.S_slow.copy(),
                 "S_fast": self.S_fast.copy(),
@@ -506,6 +580,7 @@ class CUSUMTemporalDetector:
             S_fast=self.S_fast,
             n_obs=self.n_obs,
             last_clear_time=self.last_clear_time,
+            last_update_time=self.last_update_time,
             consecutive_anomalies=self.consecutive_anomalies,
             bt14_ema=self.bt14_ema,
             bt14_ema_var=self.bt14_ema_var,
@@ -515,7 +590,7 @@ class CUSUMTemporalDetector:
             frame_count=np.array([self._frame_count]),
             # Metadata for validation on load
             n_pixels=np.array([self.n]),
-            state_version=np.array([2]),  # v2: 6-param Kalman + dual CUSUM
+            state_version=np.array([3]),  # v3: incremental cloud decay + Joseph form
         )
         logger.info("CUSUM state saved to %s (%d pixels, frame %d)", path, self.n, self._frame_count)
 
@@ -541,12 +616,12 @@ class CUSUMTemporalDetector:
                 )
                 return False
 
-            # Check state version — v1 (5-param) is incompatible with v2 (6-param)
+            # Check state version — v1 (5-param) is incompatible with v2+ (6-param)
             state_version = int(data["state_version"][0]) if "state_version" in data else 1
             if state_version < 2:
                 logger.warning(
                     "CUSUM state file is v%d (5-param Kalman) — incompatible with "
-                    "v2 (6-param); discarding and starting fresh",
+                    "v2+ (6-param); discarding and starting fresh",
                     state_version,
                 )
                 return False
@@ -557,6 +632,12 @@ class CUSUMTemporalDetector:
             self.S_fast = data["S_fast"].astype(np.float32)
             self.n_obs = data["n_obs"].astype(np.int32)
             self.last_clear_time = data["last_clear_time"].astype(np.float64)
+            # last_update_time added in v3; fall back to last_clear_time for v2 files
+            if "last_update_time" in data:
+                self.last_update_time = data["last_update_time"].astype(np.float64)
+            else:
+                self.last_update_time = self.last_clear_time.copy()
+                logger.info("Migrating v2 state: initialized last_update_time from last_clear_time")
             self.consecutive_anomalies = data["consecutive_anomalies"].astype(np.int16)
             self.bt14_ema = data["bt14_ema"].astype(np.float64)
             self.bt14_ema_var = data["bt14_ema_var"].astype(np.float64)
@@ -597,6 +678,7 @@ class CUSUMTemporalDetector:
         self.S_fast[idx] = 0.0
         self.n_obs[idx] = 0
         self.last_clear_time[idx] = np.nan
+        self.last_update_time[idx] = np.nan
         self.consecutive_anomalies[idx] = 0
         self.bt14_ema[idx] = np.nan
         self.bt14_ema_var[idx] = 0.0

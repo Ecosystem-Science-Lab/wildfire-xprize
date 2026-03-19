@@ -250,7 +250,7 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
         )
 
         # Extract fire probability stats for reporting
-        fp = cusum_result.get("fire_probability")
+        fp = cusum_result.get("fire_confidence")
         max_prob = float(np.nanmax(fp)) if fp is not None and np.any(np.isfinite(fp)) else 0.0
         n_display = 0
         if fp is not None:
@@ -324,7 +324,7 @@ async def process_observation(obs_timestamp: str, cfg: HimawariConfig) -> dict:
                     btd=btd_flat,
                     btd_predicted=btd_pred_approx.astype(np.float32),
                     z_scores=cusum_result["residuals"],
-                    fire_prob=cusum_result["fire_probability"],
+                    fire_prob=cusum_result["fire_confidence"],
                     cusum_slow=diag.get("S_slow", cusum_result["cusum_values_slow"]),
                     cusum_fast=diag.get("S_fast", cusum_result["cusum_values_fast"]),
                     bt14_anomaly=diag.get("bt14_anomaly", np.zeros_like(btd_flat, dtype=np.float32)),
