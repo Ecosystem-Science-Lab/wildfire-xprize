@@ -24,8 +24,9 @@ class FireDetectionResult:
     n_fires: int = 0
     n_absolute: int = 0
     n_contextual: int = 0
-    n_glint_rejected: int = 0
+    n_glint_downgraded: int = 0
     n_water_rejected: int = 0
+    n_insufficient_bg: int = 0
     timing_ms: dict = field(default_factory=dict)
 
 
@@ -166,14 +167,14 @@ def detect_fires(
     result.n_water_rejected = int(np.sum(valid_mask & water_mask))
     timings["water_mask"] = round((time.monotonic() - t1) * 1000, 1)
 
-    # --- Step 0c: Sun glint rejection (daytime only) ---
+    # --- Step 0c: Sun glint zone (daytime only) ---
+    # Instead of blanket rejection, flag glint-zone pixels for confidence downgrade.
+    # Fires near water should be detected at low confidence, not missed entirely.
     t1 = time.monotonic()
-    glint_mask = np.zeros(bt7.shape, dtype=bool)
+    glint_zone = np.zeros(bt7.shape, dtype=bool)
     if np.any(valid_land & is_day):
         glint_angle = _compute_glint_angle(lats, lons, obs_time)
-        glint_mask = is_day & (glint_angle < cfg.sun_glint_angle_deg)
-        result.n_glint_rejected = int(np.sum(valid_land & glint_mask))
-    valid_land = valid_land & (~glint_mask)
+        glint_zone = is_day & (glint_angle < cfg.sun_glint_angle_deg)
     timings["glint"] = round((time.monotonic() - t1) * 1000, 1)
 
     # --- Step 1: Absolute thresholds → HIGH confidence ---
@@ -252,29 +253,29 @@ def detect_fires(
 
         sufficient = actual_count >= (cfg.min_background_fraction * total_pixels)
 
-        # BT7 background stats
-        bt7_bg = np.where(bg_mask, bt7, 0.0).astype(np.float32)
+        # BT7 background stats (float64 to avoid catastrophic cancellation in variance)
+        bt7_bg = np.where(bg_mask, bt7, 0.0).astype(np.float64)
         bt7_sum = uniform_filter(bt7_bg, size=win_size, mode="constant", cval=0.0) * total_pixels
-        bt7_sq = np.where(bg_mask, bt7 ** 2, 0.0).astype(np.float32)
+        bt7_sq = np.where(bg_mask, bt7.astype(np.float64) ** 2, 0.0)
         bt7_sq_sum = uniform_filter(bt7_sq, size=win_size, mode="constant", cval=0.0) * total_pixels
 
-        safe_count = np.where(actual_count > 0, actual_count, 1.0)
-        mean_bt7 = bt7_sum / safe_count
-        var_bt7 = bt7_sq_sum / safe_count - mean_bt7 ** 2
-        var_bt7 = np.maximum(var_bt7, 0.0)  # Numerical stability
-        std_bt7 = np.sqrt(var_bt7)
+        safe_count = np.where(actual_count > 0, actual_count, 1.0).astype(np.float64)
+        mean_bt7 = (bt7_sum / safe_count).astype(np.float32)
+        var_bt7 = bt7_sq_sum / safe_count - (bt7_sum / safe_count) ** 2
+        var_bt7 = np.maximum(var_bt7, 0.0)
+        std_bt7 = np.sqrt(var_bt7).astype(np.float32)
         std_bt7 = np.maximum(std_bt7, cfg.min_background_std_k)  # Floor
 
-        # BTD background stats
-        btd_bg = np.where(bg_mask, btd, 0.0).astype(np.float32)
+        # BTD background stats (float64 for same reason)
+        btd_bg = np.where(bg_mask, btd, 0.0).astype(np.float64)
         btd_sum = uniform_filter(btd_bg, size=win_size, mode="constant", cval=0.0) * total_pixels
-        btd_sq = np.where(bg_mask, btd ** 2, 0.0).astype(np.float32)
+        btd_sq = np.where(bg_mask, btd.astype(np.float64) ** 2, 0.0)
         btd_sq_sum = uniform_filter(btd_sq, size=win_size, mode="constant", cval=0.0) * total_pixels
 
-        mean_btd = btd_sum / safe_count
-        var_btd = btd_sq_sum / safe_count - mean_btd ** 2
+        mean_btd = (btd_sum / safe_count).astype(np.float32)
+        var_btd = btd_sq_sum / safe_count - (btd_sum / safe_count) ** 2
         var_btd = np.maximum(var_btd, 0.0)
-        std_btd = np.sqrt(var_btd)
+        std_btd = np.sqrt(var_btd).astype(np.float32)
         std_btd = np.maximum(std_btd, cfg.min_background_std_k)  # Floor
 
         # Update where newly sufficient
@@ -294,7 +295,8 @@ def detect_fires(
 
     contextual_bt7 = bt7 > (bg_bt7_mean + sigma * bg_bt7_std)
     contextual_btd_sigma = btd > (bg_btd_mean + sigma * bg_btd_std)
-    contextual_btd_floor = btd > (bg_btd_mean + cfg.btd_floor_k)
+    btd_floor = np.where(is_day, cfg.btd_floor_day_k, cfg.btd_floor_night_k)
+    contextual_btd_floor = btd > (bg_btd_mean + btd_floor)
 
     # Absolute BT7 floor per spec (prevents warm non-fire pixels at night)
     bt7_floor = np.where(
@@ -311,6 +313,16 @@ def detect_fires(
         & contextual_bt7_floor
     )
     result.n_contextual = int(np.sum(contextual_fire))
+
+    # Track candidates with insufficient background (silently dropped)
+    insufficient_bg = candidates & (~bg_sufficient)
+    result.n_insufficient_bg = int(np.sum(insufficient_bg))
+    if result.n_insufficient_bg > 0:
+        logger.warning(
+            "%d candidate pixels had insufficient background — unclassified",
+            result.n_insufficient_bg,
+        )
+
     timings["contextual"] = round((time.monotonic() - t1) * 1000, 1)
 
     # --- Step 5: Confidence assignment ---
@@ -325,6 +337,12 @@ def detect_fires(
     result.fire_mask[high_btd] = 2  # NOMINAL
     # Absolute fires already set to 3 (HIGH)
 
+    # Glint-zone downgrade: NOMINAL→LOW in glint zones (fires near water
+    # should be detected at low confidence rather than missed)
+    glint_downgrade = (result.fire_mask == 2) & glint_zone
+    result.fire_mask[glint_downgrade] = 1  # NOMINAL → LOW
+    result.n_glint_downgraded = int(np.sum(glint_downgrade))
+
     timings["confidence"] = round((time.monotonic() - t1) * 1000, 1)
 
     result.n_fires = result.n_absolute + result.n_contextual
@@ -333,13 +351,14 @@ def detect_fires(
 
     logger.info(
         "Detection complete: %d absolute, %d candidates, %d contextual, %d total fires "
-        "(%d water, %d glint rejected) (%.0fms)",
+        "(%d water rejected, %d glint downgraded, %d insufficient bg) (%.0fms)",
         result.n_absolute,
         result.n_candidates,
         result.n_contextual,
         result.n_fires,
         result.n_water_rejected,
-        result.n_glint_rejected,
+        result.n_glint_downgraded,
+        result.n_insufficient_bg,
         timings["total"],
     )
 

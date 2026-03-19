@@ -35,9 +35,10 @@ class HimawariConfig(BaseModel):
     # --- Contextual thresholds ---
     sigma_day: float = 3.5
     sigma_night: float = 3.0
-    btd_floor_k: float = 6.0
+    btd_floor_day_k: float = 10.0
+    btd_floor_night_k: float = 8.0
     min_background_fraction: float = 0.25
-    background_window_sizes: list[int] = [11, 15, 21]
+    background_window_sizes: list[int] = [11, 15, 21, 31]
     # Absolute BT7 floor for contextual fires (per spec Step 5)
     contextual_floor_day_bt7_k: float = 310.0
     contextual_floor_night_bt7_k: float = 295.0
@@ -51,7 +52,7 @@ class HimawariConfig(BaseModel):
     bg_fire_night_btd_k: float = 10.0
 
     # --- Cloud masking ---
-    cloud_bt14_threshold_k: float = 265.0
+    cloud_bt14_threshold_k: float = 270.0  # Raised from 265 to catch warm/thin clouds
     cloud_adjacency_buffer: int = 2
 
     # --- Sun glint ---
