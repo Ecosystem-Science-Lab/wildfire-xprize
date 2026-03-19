@@ -56,80 +56,50 @@ logging.getLogger("botocore").setLevel(logging.WARNING)
 # Calibration targets
 # ---------------------------------------------------------------------------
 
-CALIBRATION_TARGETS = [
-    # NOTE: NOAA S3 archive (noaa-himawari9) starts 2025-11-26. No data before that.
-    #
-    # Wollemi fire -- first FIRMS detection Nov 27, 2025, nighttime, FRP=1.6 MW
-    # Archive starts Nov 26, so we get ~24h before FIRMS first detection
-    {
-        "label": "wollemi_fire_onset",
-        "lat": -32.35,
-        "lon": 150.35,
-        "start": "2025-11-26",  # Archive start (1 day before FIRMS)
-        "end": "2025-12-02",    # Through fire growth period
-        "firms_first_detection": "2025-11-27T13:00:00Z",
-        "sample_interval_min": 10,  # Every observation near fire event
-    },
-    # Background reference: same pixel, Dec 2025 (fire-free period after Wollemi)
-    {
-        "label": "wollemi_background",
-        "lat": -32.35,
-        "lon": 150.35,
-        "start": "2025-12-10",
-        "end": "2025-12-24",
-        "firms_first_detection": None,
-        "sample_interval_min": 30,  # Coarser sampling for background
-    },
-    # NSW fires -- late Dec 2025 / Jan 2026 bushfire season
-    # (Adjust these with actual FIRMS detections once data is checked)
-    {
-        "label": "nsw_fire_dec",
-        "lat": -33.86,
-        "lon": 150.76,
-        "start": "2025-12-15",
-        "end": "2025-12-22",
-        "firms_first_detection": None,  # Update after FIRMS check
-        "sample_interval_min": 10,
-    },
-    {
-        "label": "nsw_fire_jan",
-        "lat": -33.53,
-        "lon": 150.63,
-        "start": "2026-01-05",
-        "end": "2026-01-12",
-        "firms_first_detection": None,  # Update after FIRMS check
-        "sample_interval_min": 10,
-    },
-    # Industrial heat source (persistent false positive test)
-    {
-        "label": "industrial_port_kembla",
-        "lat": -34.46,
-        "lon": 150.89,
-        "start": "2025-12-01",
-        "end": "2025-12-14",
-        "firms_first_detection": None,
-        "sample_interval_min": 30,
-    },
-    # Clean background pixels (various surface types)
-    {
-        "label": "background_grassland",
-        "lat": -33.50,
-        "lon": 148.00,
-        "start": "2025-12-01",
-        "end": "2025-12-14",
-        "firms_first_detection": None,
-        "sample_interval_min": 30,
-    },
-    {
-        "label": "background_forest",
-        "lat": -35.50,
-        "lon": 149.50,
-        "start": "2025-12-01",
-        "end": "2025-12-14",
-        "firms_first_detection": None,
-        "sample_interval_min": 30,
-    },
-]
+def _load_targets() -> list[dict]:
+    """Load calibration targets from JSON file, falling back to hardcoded defaults."""
+    import json
+
+    json_path = PROJECT_ROOT / "data" / "calibration" / "sample_targets.json"
+    if json_path.exists():
+        with open(json_path) as f:
+            raw = json.load(f)
+        # Normalize to the format the rest of the script expects
+        targets = []
+        for t in raw:
+            target = {
+                "label": t["label"],
+                "lat": t["lat"],
+                "lon": t["lon"],
+                "start": t["start"],
+                "end": t["end"],
+                "firms_first_detection": t.get("firms_first_dt"),
+                "sample_interval_min": 10 if t.get("firms_first_frp", 0) > 0 else 30,
+            }
+            targets.append(target)
+        logger.info("Loaded %d targets from %s", len(targets), json_path)
+        return targets
+
+    logger.warning("No sample_targets.json found, using hardcoded defaults")
+    return [
+        {
+            "label": "wollemi_fire_onset",
+            "lat": -32.35, "lon": 150.35,
+            "start": "2025-11-26", "end": "2025-12-02",
+            "firms_first_detection": "2025-11-27T13:00:00Z",
+            "sample_interval_min": 10,
+        },
+        {
+            "label": "background_grassland",
+            "lat": -33.50, "lon": 148.00,
+            "start": "2025-12-01", "end": "2025-12-14",
+            "firms_first_detection": None,
+            "sample_interval_min": 30,
+        },
+    ]
+
+
+CALIBRATION_TARGETS = _load_targets()
 
 # ---------------------------------------------------------------------------
 # Output directory
