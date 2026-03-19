@@ -26,6 +26,9 @@ from .db import (
 )
 from .dedup import ingest_detection
 from .export import export_events_geojson
+from .himawari.config import HimawariConfig
+from .himawari.poller import poll_himawari_loop
+from .himawari import poller as himawari_poller
 from .models import Detection, Source, SystemStatus
 from .polling import scheduler
 
@@ -49,12 +52,25 @@ async def lifespan(app: FastAPI):
     dea_task = asyncio.create_task(scheduler.poll_dea_loop(settings.poll_interval_dea))
     firms_task = asyncio.create_task(scheduler.poll_firms_loop(settings.poll_interval_firms))
 
+    # Start Himawari pipeline if enabled
+    himawari_task = None
+    if settings.himawari_enabled:
+        himawari_cfg = HimawariConfig(poll_interval_s=settings.poll_interval_himawari)
+        himawari_task = asyncio.create_task(poll_himawari_loop(himawari_cfg))
+        logger.info("Himawari pipeline enabled (poll every %ds)", settings.poll_interval_himawari)
+    else:
+        logger.info("Himawari pipeline disabled")
+
     yield
 
     # Shutdown — cancel tasks and wait for them before closing DB
     dea_task.cancel()
     firms_task.cancel()
-    await asyncio.gather(dea_task, firms_task, return_exceptions=True)
+    tasks = [dea_task, firms_task]
+    if himawari_task is not None:
+        himawari_task.cancel()
+        tasks.append(himawari_task)
+    await asyncio.gather(*tasks, return_exceptions=True)
     await close_db()
     logger.info("Shutdown complete")
 
@@ -125,6 +141,9 @@ async def api_status():
         last_poll_firms=scheduler.last_poll_firms,
         last_poll_dea_ok=scheduler.last_poll_dea_ok,
         last_poll_firms_ok=scheduler.last_poll_firms_ok,
+        last_poll_himawari=himawari_poller.last_poll_himawari,
+        last_poll_himawari_ok=himawari_poller.last_poll_himawari_ok,
+        himawari_observations_processed=himawari_poller.observations_processed,
     )
     return status.model_dump()
 

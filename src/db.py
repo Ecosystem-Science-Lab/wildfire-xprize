@@ -159,7 +159,8 @@ async def create_event(det: Detection) -> int:
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             EventStatus.PROVISIONAL.value,
-            det.latitude, det.longitude, 2000.0,
+            det.latitude, det.longitude,
+            4000.0 if det.source.value == "HIMAWARI" else 2000.0,
             det.acq_datetime.isoformat(), det.acq_datetime.isoformat(),
             1, det.source.value, det.frp, det.confidence,
         ),

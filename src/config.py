@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # Event association
     event_radius_km: float = 2.0
 
+    # Himawari pipeline
+    himawari_enabled: bool = True
+    poll_interval_himawari: int = 120
+
     # Display
     timezone_display: str = "Australia/Sydney"
 

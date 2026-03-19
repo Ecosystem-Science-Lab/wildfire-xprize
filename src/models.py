@@ -65,3 +65,6 @@ class SystemStatus(BaseModel):
     last_poll_firms: Optional[datetime] = None
     last_poll_dea_ok: bool = False
     last_poll_firms_ok: bool = False
+    last_poll_himawari: Optional[datetime] = None
+    last_poll_himawari_ok: bool = False
+    himawari_observations_processed: int = 0
