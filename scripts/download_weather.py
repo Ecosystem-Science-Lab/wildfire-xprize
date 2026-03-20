@@ -41,7 +41,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 import time
 from datetime import datetime, timedelta
@@ -91,11 +90,14 @@ SILO_S3_BASE = "https://s3-ap-southeast-2.amazonaws.com/silo-open-data/Official/
 SILO_USERNAME = "alexander.shenkin@nau.edu"  # Email, used as API username
 SILO_PASSWORD = "apirequest"  # Fixed password for DataDrill API
 
-# SILO variable codes for JSON API:
-#   R=rainfall, X=max_temp, N=min_temp, V=vp, D=vp_deficit,
-#   H=rh_tmax, M=rh_tmin (at min temp), L=radiation, P=mslp,
-#   F=et_short_crop, E=evap_pan, S=evap_syn
-SILO_VARIABLE_CODES = "RXNVDHMLPE"
+# SILO variable codes for JSON API (empirically verified):
+#   R=daily_rain, X=max_temp, N=min_temp, V=vp, D=vp_deficit,
+#   H=rh_tmax, G=rh_tmin, J=radiation, M=mslp,
+#   E=evap_pan, F=et_short_crop, S=evap_syn,
+#   L=evap_morton_lake, P=et_morton_potential, A=et_morton_actual,
+#   T=et_tall_crop, W=et_morton_wet, C=evap_comb
+#   Z=ALL variables
+SILO_VARIABLE_CODES = "RXNVDHGJME"
 
 # Variables we care about for fire detection ML
 SILO_VARIABLES_OF_INTEREST = [
