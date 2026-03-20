@@ -106,6 +106,48 @@ The calibration extraction infrastructure (`scripts/calibration_extract.py`) and
 
 **Risk mitigation:** If RF does not clearly outperform tuned thresholds, keep thresholds as primary. The RF is an enhancement, not a dependency.
 
+### 6b. Chronos-2 experiment (parallel with RF)
+
+Amazon's Chronos-2 is a 120M-parameter time series foundation model that could replace the Kalman harmonic background model with zero-shot temporal prediction. Key advantage: no weeks of pre-initialization needed.
+
+**Experiment:**
+- `pip install chronos-forecasting`
+- Feed a fire pixel's BTD time series (24h context) + weather covariates
+- Compare Chronos-2 predicted BTD vs actual → residual
+- Compare residual sigma to Kalman model residual sigma on the same pixels
+- If Chronos-2 residuals are tighter, it's a better background model
+
+**Run on candidates only (1000-3000 pixels): 3-10 seconds on A10G GPU.**
+NOT feasible for all 262K pixels (15 min). Candidate-stage scorer only.
+
+**What to test on Wollemi fire data:**
+- Does Chronos-2 predict the diurnal cycle better than our 6-param harmonic model?
+- Is the fire signal (residual) more prominent against the Chronos-2 prediction?
+- Can it handle cloud gaps in the time series?
+
+**Available models:** 120M (base), 28M (small, ~2x faster, ~1% less accurate)
+
+**Decision point:** If Chronos-2 residuals are significantly tighter (>20% lower sigma) than Kalman, consider replacing CUSUM's Kalman with Chronos-2 on candidate pixels. If not, stick with calibrated Kalman.
+
+### 6c. Spatial-temporal interaction features
+
+Add features to the RF that capture the MSSTF insight — how spatial anomalies evolve temporally:
+
+- **Spatial anomaly trend:** pixel z-score minus neighbor mean z-score, tracked over 3 frames
+- **Neighbor divergence:** is this pixel warming while neighbors are not?
+- **Spatial gradient change rate:** has the BTD gradient steepened over the last hour?
+
+These capture fire's spatial signature (growing point anomaly that spreads) vs weather's (uniform regional shift). Simple features, no neural network needed.
+
+### 6d. Cascade architecture evaluation
+
+Test ChatGPT's three-stage cascade idea:
+- Stage 0: cheap all-pixel candidate generation (relaxed thresholds) → ~500-3000 candidates
+- Stage 1: RF + temporal features on candidates only
+- Stage 2: Sequential evidence accumulation (simplified CUSUM or consecutive-frame counter)
+
+Compare against current architecture on archived data. The cascade may reduce false alarms by applying expensive classifiers only to promising pixels.
+
 ---
 
 ## Phase 3: Multi-Sensor and Infrastructure (Days 10-15, March 29 - April 3)
@@ -269,7 +311,7 @@ These are anti-patterns identified through analysis and domain expert review. Th
 
 - **Do not implement MSSTF deep learning.** Wrong training domain (China), 20% FAR (4x our target), requires GPU training on simulated data, and the temporal window (72 frames = 12 hours) is not viable for real-time detection. The RF approach achieves comparable accuracy with hours of work instead of weeks.
 
-- **Do not use foundation models (GPT, etc.) as the primary detector.** These add latency, cost, and unpredictability. Fire detection is a well-understood physical signal processing problem. Contextual thresholds + RF is the right tool.
+- **Do not use foundation models as the primary full-frame detector.** But DO test Chronos-2 as a candidate-stage background model — it may outperform the Kalman harmonic model with zero pre-training.
 
 - **Do not redesign the architecture.** The two-path system (custom Himawari + DEA/FIRMS fallback) with shared event store is sound. Calibrate what we have.
 
